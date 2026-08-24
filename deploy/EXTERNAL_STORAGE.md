@@ -44,6 +44,14 @@ rclone 的 onedrive 后端不支持证书直连，因此由 `.github/scripts/one
 
 所有 S3 兼容服务共用同一套 AK/SK/签名协议，仅 `S3_ENDPOINT` 不同；上传走 rclone `s3` remote 或 `aws s3 cp`。
 
+## 二之一、脚本调用方式（权限说明）
+
+CI 用  **显式调用**上传脚本，不依赖文件的可执行位（）。
+
+> 原因：仓库先前在 Windows 上提交时 git 未记录可执行位，checkout 到 Linux runner 后脚本为 ，
+> 直接执行会报 （exit 126）。用  前缀可彻底规避，无需手动 。
+> 本地手测若直接执行，记得先 。
+
 ## 三、外置储存上的文件布局
 
 ```

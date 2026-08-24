@@ -142,8 +142,8 @@ jobs:
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
           # 上传（OneDrive 证书 / S3 通用，有哪个传哪个、都填都传；未配置静默跳过）
           pip install --quiet msal 2>/dev/null || true
-          ./.github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst"
-          ./.github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst.sha256"
+          bash .github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst"
+          bash .github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst.sha256"
 
       - name: Set package visibility public (供服务器匿名 pull)
         if: always()
