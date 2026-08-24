@@ -21,8 +21,12 @@ jobs:
           fetch-depth: 0
 
       - name: Push empty commit to keep repo active
+        # 推到非默认分支 keepalive：同样算仓库活动可保活，且永不撞 main 的分支保护规则。
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH=keepalive
+          git fetch origin "$BRANCH" || true
+          git checkout -B "$BRANCH"
           git commit --allow-empty -m "chore: keepalive — prevent scheduled workflows from being disabled after 60d inactivity"
-          git push
+          git push -f origin "$BRANCH"

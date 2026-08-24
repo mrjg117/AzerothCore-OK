@@ -62,6 +62,28 @@ jobs:
           for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
           docker buildx build $BUILDX_TAGS --push config/maps
 
+      - name: Save maps image to bundle & upload to external storage (整镜像打包)
+        env:
+          ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          ONEDRIVE_TENANT: ${{ secrets.ONEDRIVE_TENANT }}
+          ONEDRIVE_CERT: ${{ secrets.ONEDRIVE_CERT }}
+          ONEDRIVE_KEY: ${{ secrets.ONEDRIVE_KEY }}
+          ONEDRIVE_DRIVE_ID: ${{ secrets.ONEDRIVE_DRIVE_ID }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+        run: |
+          set -e
+          NS="ghcr.io/${{ github.repository_owner }}"
+          docker pull "$NS/ac-maps:latest"
+          docker save "$NS/ac-maps:latest" | zstd -T0 -o ac-maps-latest.tar.zst
+          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
+          pip install --quiet msal 2>/dev/null || true
+          ./.github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst"
+          ./.github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst.sha256"
+
       - name: Cleanup extracted data (不落盘)
         if: always()
         run: rm -rf config/maps/data /tmp/data.zip /tmp/extracted

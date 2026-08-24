@@ -31,6 +31,10 @@ PLAN="fresh"
 SOAP_CREDS="$WORK_DIR/.soap_creds"
 DB_CREDS="$WORK_DIR/.db_creds"
 SOAP_LOGIN=""; SOAP_PASSWORD=""; DB_PW=""; REALM_ADDRESS=""; IMAGE_NS=""; GM_NAME=""; GM_PASS=""
+# 外置储存部署状态（DEPLOY_SRC=ghcr | external）
+EXT_STORAGE_BASE=""; AC_VERSION=""; DEPLOY_SRC="ghcr"
+# 整镜像 bundle 的源命名空间（与 CI 推送所用 repository_owner 一致；部署端 docker load 后按 IMAGE_NS 重打标签）
+BUNDLE_NS="ghcr.io/mrjg117"
 PROXY=""
 # 默认值常量（提示语括号显示用，非历史当前值）。以本文件 SPEC.md 第 0 节为准。
 DEF_WORKDIR="/opt/azerothcore-ok"; DEF_REALM="play.example.com"; DEF_NS="ghcr.io/mrjg117"
@@ -100,6 +104,21 @@ ensure_docker(){
   command -v docker >/dev/null 2>&1 || { c_err "Docker 安装失败"; return 1; }
   c_ok "Docker 已安装"
 }
+ensure_aria2c(){
+  # 仅在外置存储模式下需要：多线程 + 断点续传下载整镜像包。缺失则自动安装。
+  command -v aria2c >/dev/null 2>&1 && return 0
+  [ "${DEPLOY_SRC:-ghcr}" != "external" ] && return 0
+  c_warn "未检测到 aria2c（外置存储下载所需），尝试自动安装..."
+  local id; id="$(detect_distro)"
+  case "$id" in
+    ubuntu|debian) apt-get update -y >/dev/null 2>&1 && apt-get install -y aria2 >/dev/null 2>&1 ;;
+    centos|rhel|fedora) ( command -v dnf >/dev/null 2>&1 && dnf install -y aria2 || yum install -y aria2 ) >/dev/null 2>&1 ;;
+    alpine) apk add --no-cache aria2 >/dev/null 2>&1 ;;
+    *) c_err "未知发行版 $id，请手动安装 aria2 后重试"; return 1 ;;
+  esac
+  command -v aria2c >/dev/null 2>&1 && { c_ok "aria2c 已安装"; return 0; }
+  c_err "aria2c 自动安装失败，请手动安装后重试"; return 1
+}
 find_history(){
   local cand="/opt/azerothcore-ok $HOME/azerothcore-ok /srv/azerothcore-ok /root/azerothcore-ok $(pwd)"
   # 历史装在非标准路径时，从运行中的容器 label 精确定位其 compose 工作目录
@@ -108,7 +127,7 @@ find_history(){
   if [ -n "$from_docker" ] && [ -d "$from_docker" ]; then HISTORY_DIR="$from_docker"; return 0; fi
   for d in $cand; do
     [ -d "$d" ] || continue
-    if [ -f "$d/.soap_creds" ] || ( [ -f "$d/.env" ] && grep -q '^IMAGE_NS=ghcr.io/mrjg117' "$d/.env" 2>/dev/null ); then
+    if [ -f "$d/.soap_creds" ] || [ -f "$d/docker-compose.yml" ] || [ -f "$d/.env" ]; then
       HISTORY_DIR="$d"; return 0
     fi
   done
@@ -124,6 +143,9 @@ load_creds(){
   [ -f "$d/.env" ] && {
     [ -z "$REALM_ADDRESS" ] && REALM_ADDRESS="$(grep '^REALM_ADDRESS=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
     [ -z "$IMAGE_NS" ] && IMAGE_NS="$(grep '^IMAGE_NS=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
+    [ -z "$DEPLOY_SRC" ] && DEPLOY_SRC="$(grep '^DEPLOY_SRC=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
+    [ -z "$EXT_STORAGE_BASE" ] && EXT_STORAGE_BASE="$(grep '^EXT_STORAGE_BASE=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
+    [ -z "$AC_VERSION" ] && AC_VERSION="$(grep '^AC_VERSION=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
   }
 }
 save_creds(){
@@ -145,11 +167,11 @@ net_menu(){
   while true; do
     echo; echo "=== 1 网络设置 ==="
     echo "1) 设置临时代理（仅本次会话）"
-    echo "2) 选择 ghcr 镜像源（列表 / 测速 / 自定义）"
+    echo "2) 配置外置存储源（整镜像包下载，免 ghcr 拉取）"
     echo "q) 返回主菜单"
     local c; c="$(ask '网络> ')"; case "$c" in
       1) set_proxy;;
-      2) select_mirror;;
+      2) ext_storage_menu;;
       q|Q) break;;
       *) c_warn "无效选择";;
     esac
@@ -159,61 +181,28 @@ set_proxy(){
   local p; p="$(ask '输入代理地址(如 http://127.0.0.1:7890，留空取消): ')"
   if [ -n "$p" ]; then export http_proxy="$p" https_proxy="$p"; PROXY="$p"; c_ok "本次会话已设置代理 $p"; else unset http_proxy https_proxy; PROXY=""; c_info "已清除代理"; fi
 }
-select_mirror(){
+ext_storage_menu(){
   while true; do
-    echo; echo "当前镜像源: ${IMAGE_NS:-ghcr.io/mrjg117}"
-    echo "1) ghcr.io/mrjg117 (官方直连，默认)"
-    echo "2) 自定义镜像前缀"
-    echo "t) 测速当前源"
+    echo; echo "=== 2 外置存储源（整镜像包下载，免 ghcr 拉取）==="
+    echo "当前: $([ "${DEPLOY_SRC:-ghcr}" = external ] && echo "外置(${EXT_STORAGE_BASE:-未配置})" || echo "ghcr 直连")"
+    echo "1) 切换为 ghcr 直连（默认）"
+    echo "2) 切换为外置存储（输入基础目录 URL）"
     echo "q) 返回"
-    local c; c="$(ask '镜像源> ')"; case "$c" in
-      1) set_ns "ghcr.io/mrjg117";;
-      2) local v; v="$(ask '输入镜像前缀(如 ghcr.1ms.run/mrjg117): ')"; [ -n "$v" ] && set_ns "$v";;
-      t|T) speed_test;;
+    local c; c="$(ask '存储> ')"; case "$c" in
+      1) DEPLOY_SRC=ghcr; set_env DEPLOY_SRC ghcr; c_ok "已切回 ghcr 直连";;
+      2)
+        local b
+        b="$(ask_tty '基础目录 URL（网盘 index / S3 挂载根，如 https://disk.example.org/acok/）: ' "${EXT_STORAGE_BASE:-}")"
+        [ -n "$b" ] && {
+          EXT_STORAGE_BASE="${b%/}"; DEPLOY_SRC=external
+          set_env EXT_STORAGE_BASE "$EXT_STORAGE_BASE"
+          set_env DEPLOY_SRC external
+          c_ok "已启用外置存储: $EXT_STORAGE_BASE（部署时下载 ac-bundle-latest.tar.zst 并 docker load）"
+        };;
       q|Q) break;;
       *) c_warn "无效选择";;
     esac
   done
-}
-set_ns(){
-  IMAGE_NS="$1"
-  c_ok "镜像源已设为 $IMAGE_NS"
-  [ -f "$WORK_DIR/.env" ] && set_env IMAGE_NS "$IMAGE_NS"
-}
-speed_test(){
-  local repo=ac-wotlk-worldserver tag=latest ns img tmp
-  ns="${IMAGE_NS:-ghcr.io/mrjg117}"
-  img="${ns}/${repo}:${tag}"
-  echo; echo ">>> 测速当前源: $img"
-  local start pid rc sz now el dtt spd avg last prev
-  tmp=$(mktemp /tmp/acok_speed.XXXXXX)
-  start=$(date +%s.%N); last=$start; prev=0
-  # 走 docker 自身鉴权(与真实 docker pull 同一条能通的路)，10s 截断，解析进度行算速度
-  timeout 10 docker pull "$img" >"$tmp" 2>&1 &
-  pid=$!
-  while kill -0 $pid 2>/dev/null; do
-    sz=$(grep -aoE '[0-9.]+MB/[0-9.]+MB' "$tmp" 2>/dev/null | tail -1 | awk -F/ '{print $1}' | sed 's/MB//' | awk '{printf "%d",($1+0)*1048576}')
-    [ -z "$sz" ] && sz=0
-    now=$(date +%s.%N); el=$(awk "BEGIN{printf \"%.1f\",$now-$start}")
-    dtt=$(awk "BEGIN{printf \"%.3f\",$now-$last}")
-    spd=0; awk "BEGIN{exit !($dtt>0)}" && spd=$(awk "BEGIN{printf \"%.2f\",($sz-$prev)/$dtt/1048576}")
-    avg=$(awk "BEGIN{printf \"%.2f\",$sz/($now-$start)/1048576}")
-    printf "\r    当前 %.2f MB/s  平均 %.2f MB/s  用时 %.1fs" "$spd" "$avg" "$el"
-    last=$now; prev=$sz; sleep 1
-  done
-  wait $pid; rc=$?
-  now=$(date +%s.%N); dt=$(awk "BEGIN{printf \"%.1f\",$now-$start}")
-  sz=$(grep -aoE '[0-9.]+MB/[0-9.]+MB' "$tmp" 2>/dev/null | tail -1 | awk -F/ '{print $1}' | sed 's/MB//' | awk '{printf "%d",($1+0)*1048576}')
-  [ -z "$sz" ] && sz=0
-  mbps=$(awk "BEGIN{printf \"%.2f\",$sz/$dt/1048576}")
-  printf "\n"
-  if [ "$sz" -gt 0 ]; then
-    note=""; [ "$rc" != "0" ] && note=" (10s 截断)"
-    c_ok "$img -> 平均 %.2f MB/s%s (用时 %.1fs)" "$mbps" "$note" "$dt"
-  else
-    c_err "$img -> 拉取失败（不可达/未公开/无网络）"
-  fi
-  rm -f "$tmp"
 }
 
 # ---------- 2 安装向导 ----------
@@ -338,6 +327,7 @@ wz_deploy(){
   set_env SOAP_PASSWORD "$SOAP_PASSWORD"
   [ -n "$DB_PW" ] && set_env DOCKER_DB_ROOT_PASSWORD "$DB_PW"
   save_creds
+  chmod 600 "$WORK_DIR/.env" 2>/dev/null || true   # B5: .env 含 SOAP/DOCKER_DB_ROOT_PASSWORD 明文，收紧权限与 .soap_creds 一致
   if [ "$PLAN" = "clean" ]; then
     c_warn "清理重装：备份凭据并销毁容器与数据卷..."
     local bk="$WORK_DIR.bak.$(date +%s)"; mkdir -p "$bk"; cp -a .env .soap_creds .db_creds "$bk"/ 2>/dev/null || true
@@ -551,7 +541,43 @@ fix_env_perms(){
   fi
 }
 
+# 外置存储：下载整镜像 bundle → sha256 校验 → docker load → 按 IMAGE_NS 重打标签
+fetch_bundle(){
+  ensure_aria2c || return 1
+  local base="${EXT_STORAGE_BASE%/}"
+  [ -z "$base" ] && { c_err "未配置外置存储源：『1 网络设置 → 外置存储源』先配置基础目录 URL"; return 1; }
+  mkdir -p "$WORK_DIR" && cd "$WORK_DIR" || { c_err "无法进入 $WORK_DIR"; return 1; }
+  local imgs="worldserver authserver db-import tools mysql maps"
+  local bn sum ok
+  for f in ac-bundle-latest.tar.zst ac-maps-latest.tar.zst; do
+    bn="$f"; sum="$f.sha256"
+    c_info "下载 $base/$bn（aria2c 多线程 + 断点续传）..."
+    if ! aria2c -c -x16 -s16 -k1M --summary-interval=10 --console-log-level=warn \
+         -d "$WORK_DIR" -o "$bn" "$base/$bn"; then
+      c_err "下载失败（$bn），可重试（支持断点续传）"; return 1
+    fi
+    c_info "下载校验文件并校验 sha256 ..."
+    curl -fsSL "$base/$sum" -o "$WORK_DIR/$sum" || { c_err "下载校验文件失败（$sum）"; return 1; }
+    ( cd "$WORK_DIR" && sha256sum -c "$sum" ) || { c_err "校验失败，包可能损坏：$bn"; return 1; }
+    c_ok "校验通过，载入镜像（docker load）..."
+    zstd -d -c "$WORK_DIR/$bn" | docker load
+  done
+  # 按部署机 IMAGE_NS 重打标签，使 docker compose 本地命中（不回退 ghcr 拉取）
+  local ns="$BUNDLE_NS" dst="${IMAGE_NS:-ghcr.io/mrjg117}"
+  local core_imgs="worldserver authserver db-import tools mysql"
+  for t in $core_imgs; do
+    docker tag "$ns/ac-wotlk-$t:latest" "$dst/ac-wotlk-$t:latest" 2>/dev/null || true
+  done
+  docker tag "$ns/ac-maps:latest" "$dst/ac-maps:latest" 2>/dev/null || true
+  c_ok "整镜像包载入完成（已按 $dst 重打标签）"
+}
+
 pull_with_eta(){
+  # 外置存储模式：整镜像包已 docker load，跳过 ghcr 拉取
+  if [ "${DEPLOY_SRC:-ghcr}" = "external" ]; then
+    fetch_bundle || return 1
+    return 0
+  fi
   local start end
   start=$(date +%s)
   c_info "开始拉取核心镜像（docker 原生进度含实时 ETA）..."
