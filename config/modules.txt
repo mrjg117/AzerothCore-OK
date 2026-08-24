@@ -35,7 +35,7 @@ https://github.com/Day36512/mod-auto-gather-tracking.git
 https://github.com/azerothcore/mod-autobalance.git
 https://github.com/poorhatsoap/mod-autolearn-skills.git
 https://github.com/ZhengPeiRu21/mod-challenge-modes.git
-https://github.com/RhinoInquiring/mod-classic-warrior-additions.git
+https://github.com/mahssel-dev/mod-classic-warrior-additions.git
 https://github.com/silviu20092/mod-dynamic-gathering-speed.git
 https://github.com/CDBrodie/mod-enhanced-worldchat.git
 https://github.com/Old-Man-Warcraft/mod-guild-levels.git
