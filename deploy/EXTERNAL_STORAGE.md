@@ -57,12 +57,12 @@ CI 用  **显式调用**上传脚本，不依赖文件的可执行位（）。
 ## 二之二、CI 依赖安装（rclone 必须显式安装）
 
 GitHub 官方 `ubuntu-latest` runner **默认不含 `rclone`**，脚本依赖它做 OneDrive / S3 上传。
-因此上传步骤里必须先安装 rclone 再调用脚本（已 pin 版本 v1.68.2，安装失败直接 `exit 1` 中断，
-避免静默跳过导致"以为传了其实没传"）：
+因此上传步骤里必须先安装 rclone 再调用脚本（官方 `install.sh` 只支持装最新 stable 或 `beta`，
+**不支持指定版本**，安装失败直接 `exit 1` 中断，避免静默跳过导致"以为传了其实没传"）：
 
 ```yaml
 # 上传步骤内、调用 upload_artifacts.sh 之前
-curl -sSfL https://rclone.org/install.sh | sudo bash -s -- --version v1.68.2
+curl -sSfL https://rclone.org/install.sh | sudo bash
 command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
 ```
 
