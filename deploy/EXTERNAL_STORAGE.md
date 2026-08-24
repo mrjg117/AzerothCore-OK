@@ -84,12 +84,18 @@ fi
   ac-maps-latest.tar.zst.sha256
 ```
 
-`<BASE>` 即 OneDrive index 软件挂出的根目录 URL（或 S3 桶前缀 URL）。例如你把包放进 OneDrive 的 `acok/` 文件夹并用 index 软件挂出，则 `EXT_STORAGE_BASE=https://disk.example.org/acok`。
+`<BASE>` 即「储存目录根路径」，只填到存储目录那一层，**不含**网盘 index 的 `/api/raw?path=` 前缀。
+例如你把包放进 OneDrive 的 `acok/` 文件夹并用 cf-index 类软件挂出，则 `EXT_STORAGE_BASE=https://dro.zhbq.eu.org/acok`。
+脚本（`raw_url`）会按 `EXT_STORAGE_TYPE` 自动拼接最终直链：
+- `cfindex`（默认）：套固定结构 `<站点>/api/raw?path=<BASE 去掉主机后的 /acok>/<file>`，即 `https://dro.zhbq.eu.org/api/raw?path=/acok/ac-maps-latest.tar.zst`；
+  这类 list 网盘（cf-index-ng 等）直链统一是 `.../api/raw?path=<从储存根开始的路径>`，脚本只负责对接 `path=` 后面的部分。
+- `direct`：普通静态直链（Nginx/S3），直接 `<BASE>/<file>`。
 
 ## 四、部署侧：启用外置
 
-运行 `acok.sh` → `1) 网络设置` → `2) 配置外置存储源` → 输入基础目录 URL。
-脚本写入 `.env` 的 `DEPLOY_SRC=external` / `EXT_STORAGE_BASE=...`。之后安装/重部署会：
+运行 `acok.sh` → `1) 网络设置` → `2) 配置外置存储源` → 输入储存目录根路径（如 `https://dro.zhbq.eu.org/acok` 或本地 `/srv/acok`）。
+可选 `3) 切换外置存储形态` 在 `cfindex` / `direct` 间切换（默认 `cfindex`）。
+脚本写入 `.env` 的 `DEPLOY_SRC=external` / `EXT_STORAGE_BASE=...` / `EXT_STORAGE_TYPE=...`。之后安装/重部署会：
 
 1. 仍从 Worker 拉取**小型配置文件**（`docker-compose.yml` / `.env` / `env.ac`）；
 2. 用 **aria2c**（外置模式下若未装则自动安装）多线程下载两个 `*.tar.zst`；
