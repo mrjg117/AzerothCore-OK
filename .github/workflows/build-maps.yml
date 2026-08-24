@@ -82,9 +82,12 @@ jobs:
           docker pull "$NS/ac-maps:latest"
           docker save "$NS/ac-maps:latest" | zstd -T0 -o ac-maps-latest.tar.zst
           sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
-          # 装 rclone（官方 runner 不含；脚本依赖它做 OneDrive/S3 上传）
-          curl -sSfL https://rclone.org/install.sh | sudo bash
-          command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
+          # OneDrive 走 Graph 直传（onedrive_upload.py），无需 rclone；
+          # rclone 仅 S3 后端需要 —— 仅当配置了 S3 凭证才安装（官方 runner 默认不含）
+          if [ -n "$S3_BUCKET" ]; then
+            curl -sSfL https://rclone.org/install.sh | sudo bash
+            command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
+          fi
           pip install --quiet msal 2>/dev/null || true
           bash .github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst"
           bash .github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst.sha256"

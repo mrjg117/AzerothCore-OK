@@ -23,16 +23,17 @@
 | `ONEDRIVE_KEY` | 是 | **私钥 PEM**（含 `-----BEGIN PRIVATE KEY-----` 整段） |
 
 > **PEM 格式容错**：`onedrive_token.py` 在交给 msal 前会**自动归一化**证书/私钥——无论你在 Secret 里粘贴的是标准多行、被压平的一行、还是带 `\r`，脚本都会重建为标准 `头行\n每64字符换行主体\n尾行` 的 PEM。即 Secret 粘贴压平一行也能用，无需手动 `fold` 重整。归一化不改变密钥内容，仅重排换行。若 Secret 根本不含 `-----BEGIN/END-----` 标签则仍会明确报错。
-| `ONEDRIVE_USER_ID` | 二选一 | 目标用户的 UPN 或 object id（如 `admin@zh33.onmicrosoft.com`）；告诉 rclone 传到**谁的盘** |
-| `ONEDRIVE_DRIVE_ID` | 二选一 | 目标 drive 的 ID；填了则忽略 `USER_ID`，直接指定盘（免 rclone 解析） |
-| `ONEDRIVE_UPLOAD_PATH` | 否 | 包上传到该用户盘**内**的目标目录（默认 `acok`）；即你要挂载/存放构建包的文件夹 |
+| `ONEDRIVE_USER_ID` | **必填** | 目标用户 UPN（如 `admin@zh33.onmicrosoft.com`）；Graph 直传经 `users/{UPN}/drive/...` 路径定位其盘，无需 drive_id |
+| `ONEDRIVE_UPLOAD_PATH` | 否 | 包上传到该盘**内**的目标目录（默认 `acok`）；即你要挂载/存放构建包的文件夹 |
 
-> 选盘：`USER_ID` 与 `DRIVE_ID` 至少其一必填。app-only 证书模式下没有 `/me`，**必须显式告知传到哪个用户的哪个盘**——这正是 `USER_ID`（或 `DRIVE_ID`）的作用。
+> **重要（2026-08-24 方案定稿）**：OneDrive 上传**改用 Microsoft Graph upload session 直传**（`.github/scripts/onedrive_upload.py`），不再依赖 rclone。原因：rclone onedrive 后端在 **app-only（证书）场景下官方明确不支持**（`onedrive` 类型不能用于 client_credentials，只能走 `sharepoint` 类型 + 显式 `drive_id`，配置繁琐）。Graph 直传原生支持 app-only，用 **UPN 路径**定位用户盘，**免 drive_id、免 rclone、免 user 配置项**。
 > 目录：`UPLOAD_PATH` 决定包落在该盘的哪个子目录，对应部署端 `EXT_STORAGE_BASE` 指向的那个文件夹。
 
 应用权限需 `Files.ReadWrite.All`（Application 类型）。本方案**不使用 client secret**：
-rclone 的 onedrive 后端不支持证书直连，因此由 `.github/scripts/onedrive_token.py` 用 msal
-以**证书签名 client_assertion** 换 Graph app-only 令牌，再把令牌喂给 rclone 的 `token` +（`drive_id` 或 `user`）配置上传。
+由 `.github/scripts/onedrive_upload.py` 用 msal 以**证书签名 client_assertion** 换 Graph app-only 令牌，
+再调用 Graph 的 `createUploadSession` + 分片 `PUT` 直传（单分片 60 MiB、顺序上传、支持断点续传）。
+效率说明：单文件分片顺序上传（Graph 协议层不支持同 session 并发分片），但通过大分片(60MiB)+HTTP 持久连接即可跑满带宽；
+每次同时传 `.tar.zst` 与 `.sha256` 两个文件，可各自开 session **并行**，整体不比 rclone 慢。
 
 ### S3（通用：AWS / Cloudflare R2 / B2-S3 / MinIO 等，仅 endpoint 不同）
 
@@ -54,20 +55,22 @@ CI 用  **显式调用**上传脚本，不依赖文件的可执行位（）。
 > 直接执行会报 （exit 126）。用  前缀可彻底规避，无需手动 。
 > 本地手测若直接执行，记得先 。
 
-## 二之二、CI 依赖安装（rclone 必须显式安装）
+## 二之二、CI 依赖安装（rclone 仅 S3 需要）
 
-GitHub 官方 `ubuntu-latest` runner **默认不含 `rclone`**，脚本依赖它做 OneDrive / S3 上传。
-因此上传步骤里必须先安装 rclone 再调用脚本（官方 `install.sh` 只支持装最新 stable 或 `beta`，
-**不支持指定版本**，安装失败直接 `exit 1` 中断，避免静默跳过导致"以为传了其实没传"）：
+OneDrive 走 Graph 直传（`.github/scripts/onedrive_upload.py`），**仅需 `msal`、无需 rclone**。
+`rclone` 只服务于 **S3 后端**，且 GitHub 官方 `ubuntu-latest` runner 默认不含，因此 workflow 中
+**仅当配置了 `S3_BUCKET` 才安装 rclone**（官方 `install.sh` 只支持装最新 stable 或 `beta`，
+**不支持指定版本**，安装失败直接 `exit 1` 中断）：
 
 ```yaml
-# 上传步骤内、调用 upload_artifacts.sh 之前
-curl -sSfL https://rclone.org/install.sh | sudo bash
-command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
+# 上传步骤内、调用 upload_artifacts.sh 之前（仅 S3 场景）
+if [ -n "$S3_BUCKET" ]; then
+  curl -sSfL https://rclone.org/install.sh | sudo bash
+  command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
+fi
 ```
 
-脚本侧同步加固：`backend_onedrive` 也加了 `command -v rclone` 前置检查，缺失时打印明确告警并跳过
-（与 `backend_s3` 行为一致），不再出现裸 `rclone: command not found`。
+`msal` 在所有场景都需要（OneDrive 证书换令牌）：`pip install --quiet msal`。
 
 > 注：早期提交的脚本头注释写"CI 镜像自带 / 可 apt 安装"是错误假设，已修正为"必须由调用方 CI 步骤显式安装"。
 
