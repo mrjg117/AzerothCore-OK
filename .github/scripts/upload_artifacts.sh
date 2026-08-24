@@ -3,7 +3,9 @@
 # upload_artifacts.sh —— 把构建产物传到「已配置的外置后端」
 # ------------------------------------------------------------
 # 语义（重要）：不是二选一，而是「有哪个的凭证就传哪个、都填了就都传」。
-#   - OneDrive：E5 账号 + 自建应用 + 证书鉴权（app-only，非交互）
+#   - OneDrive：E5 账号 + 自建应用 + 证书鉴权（app-only，非交互）；
+#                **必须**配置 ONEDRIVE_DRIVE_ID（rclone onedrive 后端不支持 user/UPN 自动解析盘，
+#                缺 drive_id 会报 "unable to get drive_id and drive_type"）。
 #   - S3      ：通用 S3 凭证（AWS / Cloudflare R2 / B2-S3 / MinIO 等，仅 endpoint 不同）
 # 任一后端未配置凭证则静默跳过，不会报错；都不配置则什么都不传（ghcr 仍保留）。
 #
@@ -24,17 +26,19 @@ subdir="${ONEDRIVE_UPLOAD_PATH:-${2:-acok}}"
 name="$(basename "$f")"
 
 backend_onedrive(){
-  # 选盘：user_id 或 drive_id 至少其一（缺则视为未配置 → 跳过）
-  if [ -z "${ONEDRIVE_USER_ID:-}" ] && [ -z "${ONEDRIVE_DRIVE_ID:-}" ]; then
-    return 0
-  fi
-  # 证书四件套 + 应用 ID 缺一不可
+  # 证书四件套 + 应用 ID + drive_id 缺一不可
+  # 注：rclone onedrive 后端不支持用 user(UPN) 自动解析 drive，app-only 场景必须显式 drive_id，
+  # 否则报 "unable to get drive_id and drive_type"。因此此处强制要求 ONEDRIVE_DRIVE_ID。
   [ -z "${ONEDRIVE_CLIENT_ID:-}" ] && return 0
   [ -z "${ONEDRIVE_TENANT:-}" ]    && return 0
   [ -z "${ONEDRIVE_CERT:-}" ]      && return 0
   [ -z "${ONEDRIVE_KEY:-}" ]       && return 0
+  if [ -z "${ONEDRIVE_DRIVE_ID:-}" ]; then
+    echo "   OneDrive 未配置 ONEDRIVE_DRIVE_ID（rclone 必须显式指定 drive_id），跳过该后端" >&2
+    return 0
+  fi
 
-  echo ">> [OneDrive] 证书鉴权上传 $name -> ${subdir}/$name (user=${ONEDRIVE_USER_ID:-drive_id=${ONEDRIVE_DRIVE_ID:-?}})"
+  echo ">> [OneDrive] 证书鉴权上传 $name -> ${subdir}/$name (drive_id=${ONEDRIVE_DRIVE_ID})"
   # 0) rclone 前置检查（与 S3 分支一致，缺失则明确跳过而非 command not found）
   if ! command -v rclone >/dev/null 2>&1; then
     echo "   rclone 未安装，OneDrive 后端跳过（请在 CI 步骤中安装 rclone）" >&2
@@ -44,21 +48,14 @@ backend_onedrive(){
   token_json="$(python3 "$(dirname "$0")/onedrive_token.py")" || {
     echo "   OneDrive 令牌获取失败，跳过该后端" >&2; return 0
   }
-  # 2) 写 rclone 配置：drive_id 优先直接指定盘；否则用 user_id 让 rclone
-  #    解析该用户的 drive（app-only + Files.ReadWrite.All 权限，无需 client secret）
-  drive_conf=""
-  if [ -n "${ONEDRIVE_DRIVE_ID:-}" ]; then
-    drive_conf="drive_id = ${ONEDRIVE_DRIVE_ID}"
-  else
-    drive_conf="user = ${ONEDRIVE_USER_ID}
-drive_type = business"
-  fi
+  # 2) 写 rclone 配置：app-only + 显式 drive_id（drive_type=business 指明企业盘）
   cat > /tmp/rclone-od.conf <<EOF
 [acok]
 type = onedrive
 client_id = ${ONEDRIVE_CLIENT_ID}
 token = ${token_json}
-${drive_conf}
+drive_id = ${ONEDRIVE_DRIVE_ID}
+drive_type = business
 region = global
 EOF
   # 3) 上传（失败不阻断，仅告警）

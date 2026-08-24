@@ -23,16 +23,15 @@
 | `ONEDRIVE_KEY` | 是 | **私钥 PEM**（含 `-----BEGIN PRIVATE KEY-----` 整段） |
 
 > **PEM 格式容错**：`onedrive_token.py` 在交给 msal 前会**自动归一化**证书/私钥——无论你在 Secret 里粘贴的是标准多行、被压平的一行、还是带 `\r`，脚本都会重建为标准 `头行\n每64字符换行主体\n尾行` 的 PEM。即 Secret 粘贴压平一行也能用，无需手动 `fold` 重整。归一化不改变密钥内容，仅重排换行。若 Secret 根本不含 `-----BEGIN/END-----` 标签则仍会明确报错。
-| `ONEDRIVE_USER_ID` | 二选一 | 目标用户的 UPN 或 object id（如 `admin@zh33.onmicrosoft.com`）；告诉 rclone 传到**谁的盘** |
-| `ONEDRIVE_DRIVE_ID` | 二选一 | 目标 drive 的 ID；填了则忽略 `USER_ID`，直接指定盘（免 rclone 解析） |
-| `ONEDRIVE_UPLOAD_PATH` | 否 | 包上传到该用户盘**内**的目标目录（默认 `acok`）；即你要挂载/存放构建包的文件夹 |
+| `ONEDRIVE_DRIVE_ID` | **必填** | 目标 drive 的 ID（形如 `b!AbCdEf...`）；rclone onedrive 后端**必须显式指定**，不支持用 UPN/user 自动解析 |
+| `ONEDRIVE_UPLOAD_PATH` | 否 | 包上传到该盘**内**的目标目录（默认 `acok`）；即你要挂载/存放构建包的文件夹 |
 
-> 选盘：`USER_ID` 与 `DRIVE_ID` 至少其一必填。app-only 证书模式下没有 `/me`，**必须显式告知传到哪个用户的哪个盘**——这正是 `USER_ID`（或 `DRIVE_ID`）的作用。
+> **重要（2026-08-24 修正）**：早期版本支持 `ONEDRIVE_USER_ID`（UPN）让 rclone 自动解析盘，但实测 rclone onedrive 后端**没有 `user` 配置项**，缺 `drive_id` 会直接报 `unable to get drive_id and drive_type`。因此 **`ONEDRIVE_USER_ID` 已废弃，改由 `ONEDRIVE_DRIVE_ID` 必填**。drive ID 获取方式：Graph `/me/drive` 或 Azure 门户 / OneDrive 开发者工具提取。
 > 目录：`UPLOAD_PATH` 决定包落在该盘的哪个子目录，对应部署端 `EXT_STORAGE_BASE` 指向的那个文件夹。
 
 应用权限需 `Files.ReadWrite.All`（Application 类型）。本方案**不使用 client secret**：
 rclone 的 onedrive 后端不支持证书直连，因此由 `.github/scripts/onedrive_token.py` 用 msal
-以**证书签名 client_assertion** 换 Graph app-only 令牌，再把令牌喂给 rclone 的 `token` +（`drive_id` 或 `user`）配置上传。
+以**证书签名 client_assertion** 换 Graph app-only 令牌，再把令牌喂给 rclone 的 `token` + `drive_id` + `drive_type = business` 配置上传。
 
 ### S3（通用：AWS / Cloudflare R2 / B2-S3 / MinIO 等，仅 endpoint 不同）
 

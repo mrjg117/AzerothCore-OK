@@ -122,6 +122,9 @@ exp = int(time.time()) + int(token.get("expires_in", 3600))
 out = {
     "access_token": token["access_token"],
     "token_type": token.get("token_type", "Bearer"),
+    # app-only 流程无 refresh_token；rclone 的 token blob 要求该键存在（空串即可），
+    # 否则 rclone 初始化 onedrive remote 时会报配置不完整。
+    "refresh_token": "",
     "expiry": time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime(exp)),
 }
 print(json.dumps(out))
