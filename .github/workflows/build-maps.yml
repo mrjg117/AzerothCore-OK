@@ -83,8 +83,8 @@ jobs:
           docker save "$NS/ac-maps:latest" | zstd -T0 -o ac-maps-latest.tar.zst
           sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
           pip install --quiet msal 2>/dev/null || true
-          ./.github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst"
-          ./.github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst.sha256"
+          bash .github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst"
+          bash .github/scripts/upload_artifacts.sh "ac-maps-latest.tar.zst.sha256"
 
       - name: Cleanup extracted data (不落盘)
         if: always()
