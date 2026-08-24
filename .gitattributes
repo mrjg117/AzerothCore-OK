@@ -1,0 +1,6 @@
+# 强制以 LF 行尾存储/检出，避免 Windows 编辑引入 CRLF 导致 CI 脚本报
+# bash: set: pipefail: invalid option name / $'\r': command not found
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
