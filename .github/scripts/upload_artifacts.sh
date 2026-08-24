@@ -4,17 +4,21 @@
 # ------------------------------------------------------------
 # 语义（重要）：不是二选一，而是「有哪个的凭证就传哪个、都填了就都传」。
 #   - OneDrive：E5 账号 + 自建应用 + 证书鉴权（app-only，非交互）；
-#                **必须**配置 ONEDRIVE_DRIVE_ID（rclone onedrive 后端不支持 user/UPN 自动解析盘，
-#                缺 drive_id 会报 "unable to get drive_id and drive_type"）。
-#   - S3      ：通用 S3 凭证（AWS / Cloudflare R2 / B2-S3 / MinIO 等，仅 endpoint 不同）
+#               经 Microsoft Graph upload session 直传（onedrive_upload.py），
+#               用 UPN（ONEDRIVE_USER_ID）定位用户盘，**不需要 drive_id、不需要 rclone**。
+#               免 drive_id 原因：rclone onedrive 后端在 app-only 场景必须显式 drive_id，
+#               且 onedrive 类型官方明确不支持 client_credentials，配置繁琐；
+#               Graph 直传原生支持 app-only + UPN 路径，更干净。
+#   - S3      ：通用 S3 凭证（AWS / Cloudflare R2 / B2-S3 / MinIO 等，仅 endpoint 不同），
+#               仍用 rclone（S3 后端无此限制）。
 # 任一后端未配置凭证则静默跳过，不会报错；都不配置则什么都不传（ghcr 仍保留）。
 #
 # 用法:  .github/scripts/upload_artifacts.sh <file> [remote-subdir]
 #   <file>          本地文件路径（如 ac-bundle-latest.tar.zst）
 #   [remote-subdir] 远端子目录（默认 acok/），文件落地为 <subdir>/<basename>
 #
-# 依赖: rclone（必须由调用方 CI 步骤显式安装，官方 runner 默认不含）；
-#       msal（仅 OneDrive 换令牌，python3 -m pip install msal）
+# 依赖: msal（仅 OneDrive 证书换令牌，python3 -m pip install msal）；
+#       rclone（仅 S3 后端需要，由调用方 CI 步骤显式安装，官方 runner 默认不含）。
 # ============================================================
 set -euo pipefail
 
@@ -26,43 +30,18 @@ subdir="${ONEDRIVE_UPLOAD_PATH:-${2:-acok}}"
 name="$(basename "$f")"
 
 backend_onedrive(){
-  # 证书四件套 + 应用 ID + drive_id 缺一不可
-  # 注：rclone onedrive 后端不支持用 user(UPN) 自动解析 drive，app-only 场景必须显式 drive_id，
-  # 否则报 "unable to get drive_id and drive_type"。因此此处强制要求 ONEDRIVE_DRIVE_ID。
+  # 证书四件套 + 应用 ID + 用户 UPN 缺一不可
   [ -z "${ONEDRIVE_CLIENT_ID:-}" ] && return 0
   [ -z "${ONEDRIVE_TENANT:-}" ]    && return 0
   [ -z "${ONEDRIVE_CERT:-}" ]      && return 0
   [ -z "${ONEDRIVE_KEY:-}" ]       && return 0
-  if [ -z "${ONEDRIVE_DRIVE_ID:-}" ]; then
-    echo "   OneDrive 未配置 ONEDRIVE_DRIVE_ID（rclone 必须显式指定 drive_id），跳过该后端" >&2
-    return 0
-  fi
+  [ -z "${ONEDRIVE_USER_ID:-}" ]   && { echo "   OneDrive 未配置 ONEDRIVE_USER_ID（目标用户 UPN），跳过该后端" >&2; return 0; }
 
-  echo ">> [OneDrive] 证书鉴权上传 $name -> ${subdir}/$name (drive_id=${ONEDRIVE_DRIVE_ID})"
-  # 0) rclone 前置检查（与 S3 分支一致，缺失则明确跳过而非 command not found）
-  if ! command -v rclone >/dev/null 2>&1; then
-    echo "   rclone 未安装，OneDrive 后端跳过（请在 CI 步骤中安装 rclone）" >&2
-    return 0
-  fi
-  # 1) 用证书换 app-only 访问令牌（client_assertion，JWT 由证书私钥签名）
-  token_json="$(python3 "$(dirname "$0")/onedrive_token.py")" || {
-    echo "   OneDrive 令牌获取失败，跳过该后端" >&2; return 0
-  }
-  # 2) 写 rclone 配置：app-only + 显式 drive_id（drive_type=business 指明企业盘）
-  cat > /tmp/rclone-od.conf <<EOF
-[acok]
-type = onedrive
-client_id = ${ONEDRIVE_CLIENT_ID}
-token = ${token_json}
-drive_id = ${ONEDRIVE_DRIVE_ID}
-drive_type = business
-region = global
-EOF
-  # 3) 上传（失败不阻断，仅告警）
-  rclone --config /tmp/rclone-od.conf copy "$f" "acok:${subdir}/$name" || {
+  echo ">> [OneDrive] 证书鉴权上传 $name -> ${subdir}/$name (user=${ONEDRIVE_USER_ID})"
+  # Graph upload session 直传（内部含证书换令牌 + 60MiB 分片顺序上传 + 断点续传）
+  python3 "$(dirname "$0")/onedrive_upload.py" "$f" "$subdir" || {
     echo "   OneDrive 上传失败，跳过该后端" >&2; return 0
   }
-  echo "   OneDrive 上传完成"
 }
 
 backend_s3(){

@@ -31,3 +31,5 @@ deploy/patches/patches-client.zip
 deploy/patches/patches-client.zip.*          # split 分卷产物
 deploy/patches/patches-manifest.txt          # 分卷清单（构建生成）
 deploy/docker-compose.yml                    # 官方基础编排，构建时从 GitHub 拉下打包，不进仓库
+__pycache__/
+*.pyc
