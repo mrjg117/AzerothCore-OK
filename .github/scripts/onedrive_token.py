@@ -20,6 +20,7 @@
 #   {"access_token":"...","token_type":"Bearer","expiry":"YYYY-mm-ddTHH:MM:SS.000000000Z"}
 # ============================================================
 import os
+import re
 import sys
 import time
 import json
@@ -47,6 +48,54 @@ for var, val in (
     if not val:
         sys.stderr.write(f"缺少环境变量 {var}\n")
         sys.exit(2)
+
+
+def normalize_pem(raw: str, what: str) -> str:
+    """把任意形态(压平一行 / 带 \\r / 缺换行)的 PEM 归一为标准多行 PEM。
+
+    只重排换行，不改变密钥内容。识别 -----BEGIN <标签>----- ... -----END <标签>-----
+    之间的 base64 主体，去除所有空白后按每 64 字符重新换行。
+    标签支持 CERTIFICATE / PRIVATE KEY / RSA PRIVATE KEY / EC PRIVATE KEY 等。
+    """
+    if not raw:
+        return raw
+    raw = raw.replace("\r", "")
+    m = re.search(
+        r"-----BEGIN ([A-Z0-9 ]*?(?:PRIVATE KEY|CERTIFICATE))-----(.*?)-----END \1-----",
+        raw, re.S,
+    )
+    if not m:
+        # 无标准标签：原样返回，交由下方 cryptography 校验给出明确人话报错
+        return raw
+    label = m.group(1)
+    body = re.sub(r"\s+", "", m.group(2))
+    if not body:
+        return raw
+    chunks = [body[i:i + 64] for i in range(0, len(body), 64)]
+    return "-----BEGIN {}-----\n{}\n-----END {}-----\n".format(
+        label, "\n".join(chunks), label
+    )
+
+
+cert_pem = normalize_pem(cert_pem, "cert")
+key_pem = normalize_pem(key_pem, "key")
+
+# 前置校验：归一化后若仍解析失败，给人话而非 msal 深层 traceback
+try:
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.x509 import load_pem_x509_certificate
+    load_pem_private_key(key_pem.encode(), password=None)
+    load_pem_x509_certificate(cert_pem.encode())
+except Exception as e:  # noqa
+    sys.stderr.write(
+        "ONEDRIVE 证书/私钥经归一化后仍无法解析: {}\n".format(e)
+        + "  常见原因: (1) Secret 不含 -----BEGIN/END----- 标签;\n"
+        + "            (2) 粘贴的不是 X.509 证书+私钥对;\n"
+        + "            (3) 内容被截断。\n"
+        + "  本地自检: openssl x509 -in cert.pem -noout -subject\n"
+        + "            openssl pkey  -in key.pem  -check  -noout\n"
+    )
+    sys.exit(2)
 
 # 证书指纹(thumbprint)：SHA1(证书 DER)，msal 证书鉴权必需
 try:

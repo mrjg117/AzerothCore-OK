@@ -19,8 +19,10 @@
 |---|---|---|
 | `ONEDRIVE_CLIENT_ID` | 是 | Azure AD 企业应用的(客户端) ID |
 | `ONEDRIVE_TENANT` | 是 | 租户 ID（如 `zh33.onmicrosoft.com` 或 GUID） |
-| `ONEDRIVE_CERT` | 是 | **证书 PEM**（含 `-----BEGIN CERTIFICATE-----` 整段，含换行） |
+| `ONEDRIVE_CERT` | 是 | **证书 PEM**（含 `-----BEGIN CERTIFICATE-----` 整段） |
 | `ONEDRIVE_KEY` | 是 | **私钥 PEM**（含 `-----BEGIN PRIVATE KEY-----` 整段） |
+
+> **PEM 格式容错**：`onedrive_token.py` 在交给 msal 前会**自动归一化**证书/私钥——无论你在 Secret 里粘贴的是标准多行、被压平的一行、还是带 `\r`，脚本都会重建为标准 `头行\n每64字符换行主体\n尾行` 的 PEM。即 Secret 粘贴压平一行也能用，无需手动 `fold` 重整。归一化不改变密钥内容，仅重排换行。若 Secret 根本不含 `-----BEGIN/END-----` 标签则仍会明确报错。
 | `ONEDRIVE_USER_ID` | 二选一 | 目标用户的 UPN 或 object id（如 `admin@zh33.onmicrosoft.com`）；告诉 rclone 传到**谁的盘** |
 | `ONEDRIVE_DRIVE_ID` | 二选一 | 目标 drive 的 ID；填了则忽略 `USER_ID`，直接指定盘（免 rclone 解析） |
 | `ONEDRIVE_UPLOAD_PATH` | 否 | 包上传到该用户盘**内**的目标目录（默认 `acok`）；即你要挂载/存放构建包的文件夹 |
