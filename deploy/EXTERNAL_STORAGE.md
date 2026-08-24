@@ -54,6 +54,23 @@ CI 用  **显式调用**上传脚本，不依赖文件的可执行位（）。
 > 直接执行会报 （exit 126）。用  前缀可彻底规避，无需手动 。
 > 本地手测若直接执行，记得先 。
 
+## 二之二、CI 依赖安装（rclone 必须显式安装）
+
+GitHub 官方 `ubuntu-latest` runner **默认不含 `rclone`**，脚本依赖它做 OneDrive / S3 上传。
+因此上传步骤里必须先安装 rclone 再调用脚本（已 pin 版本 v1.68.2，安装失败直接 `exit 1` 中断，
+避免静默跳过导致"以为传了其实没传"）：
+
+```yaml
+# 上传步骤内、调用 upload_artifacts.sh 之前
+curl -sSfL https://rclone.org/install.sh | sudo bash -s -- --version v1.68.2
+command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
+```
+
+脚本侧同步加固：`backend_onedrive` 也加了 `command -v rclone` 前置检查，缺失时打印明确告警并跳过
+（与 `backend_s3` 行为一致），不再出现裸 `rclone: command not found`。
+
+> 注：早期提交的脚本头注释写"CI 镜像自带 / 可 apt 安装"是错误假设，已修正为"必须由调用方 CI 步骤显式安装"。
+
 ## 三、外置储存上的文件布局
 
 ```

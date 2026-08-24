@@ -11,7 +11,8 @@
 #   <file>          本地文件路径（如 ac-bundle-latest.tar.zst）
 #   [remote-subdir] 远端子目录（默认 acok/），文件落地为 <subdir>/<basename>
 #
-# 依赖: rclone（CI 镜像自带 / 可 apt 安装）；msal（仅 OneDrive，python3 -m pip install msal）
+# 依赖: rclone（必须由调用方 CI 步骤显式安装，官方 runner 默认不含）；
+#       msal（仅 OneDrive 换令牌，python3 -m pip install msal）
 # ============================================================
 set -euo pipefail
 
@@ -34,6 +35,11 @@ backend_onedrive(){
   [ -z "${ONEDRIVE_KEY:-}" ]       && return 0
 
   echo ">> [OneDrive] 证书鉴权上传 $name -> ${subdir}/$name (user=${ONEDRIVE_USER_ID:-drive_id=${ONEDRIVE_DRIVE_ID:-?}})"
+  # 0) rclone 前置检查（与 S3 分支一致，缺失则明确跳过而非 command not found）
+  if ! command -v rclone >/dev/null 2>&1; then
+    echo "   rclone 未安装，OneDrive 后端跳过（请在 CI 步骤中安装 rclone）" >&2
+    return 0
+  fi
   # 1) 用证书换 app-only 访问令牌（client_assertion，JWT 由证书私钥签名）
   token_json="$(python3 "$(dirname "$0")/onedrive_token.py")" || {
     echo "   OneDrive 令牌获取失败，跳过该后端" >&2; return 0
