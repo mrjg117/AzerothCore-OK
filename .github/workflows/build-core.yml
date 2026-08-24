@@ -141,6 +141,9 @@ jobs:
             | zstd -T0 -o ac-bundle-latest.tar.zst
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
           # 上传（OneDrive 证书 / S3 通用，有哪个传哪个、都填都传；未配置静默跳过）
+          # 装 rclone（官方 runner 不含；脚本依赖它做 OneDrive/S3 上传）
+          curl -sSfL https://rclone.org/install.sh | sudo bash -s -- --version v1.68.2
+          command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
           pip install --quiet msal 2>/dev/null || true
           bash .github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst"
           bash .github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst.sha256"
