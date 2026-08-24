@@ -17,29 +17,42 @@ set -o pipefail
 
 f="$1"
 [ -f "$f" ] || { echo "upload: 文件不存在: $f" >&2; exit 1; }
-subdir="${2:-acok}"
+# 上传目录：优先环境变量 ONEDRIVE_UPLOAD_PATH（用户在 CI Secret 指定盘内目录），
+# 否则退到命令行第二参数，再退默认 acok
+subdir="${ONEDRIVE_UPLOAD_PATH:-${2:-acok}}"
 name="$(basename "$f")"
 
 backend_onedrive(){
-  # 五个凭证缺一不可，否则视为未配置 → 跳过
+  # 选盘：user_id 或 drive_id 至少其一（缺则视为未配置 → 跳过）
+  if [ -z "${ONEDRIVE_USER_ID:-}" ] && [ -z "${ONEDRIVE_DRIVE_ID:-}" ]; then
+    return 0
+  fi
+  # 证书四件套 + 应用 ID 缺一不可
   [ -z "${ONEDRIVE_CLIENT_ID:-}" ] && return 0
   [ -z "${ONEDRIVE_TENANT:-}" ]    && return 0
   [ -z "${ONEDRIVE_CERT:-}" ]      && return 0
   [ -z "${ONEDRIVE_KEY:-}" ]       && return 0
-  [ -z "${ONEDRIVE_DRIVE_ID:-}" ]  && return 0
 
-  echo ">> [OneDrive] 证书鉴权上传 $name -> acok/$name"
+  echo ">> [OneDrive] 证书鉴权上传 $name -> ${subdir}/$name (user=${ONEDRIVE_USER_ID:-drive_id=${ONEDRIVE_DRIVE_ID:-?}})"
   # 1) 用证书换 app-only 访问令牌（client_assertion，JWT 由证书私钥签名）
   token_json="$(python3 "$(dirname "$0")/onedrive_token.py")" || {
     echo "   OneDrive 令牌获取失败，跳过该后端" >&2; return 0
   }
-  # 2) 写 rclone 配置（提供 token + drive_id，走 app-only，无需 client secret）
+  # 2) 写 rclone 配置：drive_id 优先直接指定盘；否则用 user_id 让 rclone
+  #    解析该用户的 drive（app-only + Files.ReadWrite.All 权限，无需 client secret）
+  drive_conf=""
+  if [ -n "${ONEDRIVE_DRIVE_ID:-}" ]; then
+    drive_conf="drive_id = ${ONEDRIVE_DRIVE_ID}"
+  else
+    drive_conf="user = ${ONEDRIVE_USER_ID}
+drive_type = business"
+  fi
   cat > /tmp/rclone-od.conf <<EOF
 [acok]
 type = onedrive
 client_id = ${ONEDRIVE_CLIENT_ID}
 token = ${token_json}
-drive_id = ${ONEDRIVE_DRIVE_ID}
+${drive_conf}
 region = global
 EOF
   # 3) 上传（失败不阻断，仅告警）

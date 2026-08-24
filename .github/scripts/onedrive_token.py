@@ -13,6 +13,8 @@
 #   ONEDRIVE_CERT      证书 PEM（含 -----BEGIN CERTIFICATE-----）
 #   ONEDRIVE_KEY       私钥 PEM（含 -----BEGIN PRIVATE KEY----- / EC PRIVATE KEY）
 #   （可选）ONEDRIVE_SCOPE  默认 https://graph.microsoft.com/.default
+#   注：选盘/目录变量（ONEDRIVE_USER_ID / ONEDRIVE_DRIVE_ID / ONEDRIVE_UPLOAD_PATH）
+#       在 upload_artifacts.sh 中消费，本脚本只负责证书→令牌。
 #
 # 输出：rclone 可直读的 token JSON：
 #   {"access_token":"...","token_type":"Bearer","expiry":"YYYY-mm-ddTHH:MM:SS.000000000Z"}

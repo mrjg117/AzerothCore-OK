@@ -15,17 +15,22 @@
 
 ### OneDrive（E5 账号 + 自建应用 + 证书鉴权，app-only 非交互）
 
-| Secret | 说明 |
-|---|---|
-| `ONEDRIVE_CLIENT_ID` | Azure AD 企业应用的(客户端) ID |
-| `ONEDRIVE_TENANT` | 租户 ID（如 `zh33.onmicrosoft.com` 或 GUID） |
-| `ONEDRIVE_CERT` | **证书 PEM**（含 `-----BEGIN CERTIFICATE-----` 整段，含换行） |
-| `ONEDRIVE_KEY` | **私钥 PEM**（含 `-----BEGIN PRIVATE KEY-----` 整段） |
-| `ONEDRIVE_DRIVE_ID` | 目标 OneDrive 的 drive ID（Graph `/users/{upn}/drive` 获取） |
+| Secret | 必填 | 说明 |
+|---|---|---|
+| `ONEDRIVE_CLIENT_ID` | 是 | Azure AD 企业应用的(客户端) ID |
+| `ONEDRIVE_TENANT` | 是 | 租户 ID（如 `zh33.onmicrosoft.com` 或 GUID） |
+| `ONEDRIVE_CERT` | 是 | **证书 PEM**（含 `-----BEGIN CERTIFICATE-----` 整段，含换行） |
+| `ONEDRIVE_KEY` | 是 | **私钥 PEM**（含 `-----BEGIN PRIVATE KEY-----` 整段） |
+| `ONEDRIVE_USER_ID` | 二选一 | 目标用户的 UPN 或 object id（如 `admin@zh33.onmicrosoft.com`）；告诉 rclone 传到**谁的盘** |
+| `ONEDRIVE_DRIVE_ID` | 二选一 | 目标 drive 的 ID；填了则忽略 `USER_ID`，直接指定盘（免 rclone 解析） |
+| `ONEDRIVE_UPLOAD_PATH` | 否 | 包上传到该用户盘**内**的目标目录（默认 `acok`）；即你要挂载/存放构建包的文件夹 |
+
+> 选盘：`USER_ID` 与 `DRIVE_ID` 至少其一必填。app-only 证书模式下没有 `/me`，**必须显式告知传到哪个用户的哪个盘**——这正是 `USER_ID`（或 `DRIVE_ID`）的作用。
+> 目录：`UPLOAD_PATH` 决定包落在该盘的哪个子目录，对应部署端 `EXT_STORAGE_BASE` 指向的那个文件夹。
 
 应用权限需 `Files.ReadWrite.All`（Application 类型）。本方案**不使用 client secret**：
 rclone 的 onedrive 后端不支持证书直连，因此由 `.github/scripts/onedrive_token.py` 用 msal
-以**证书签名 client_assertion** 换 Graph app-only 令牌，再把令牌喂给 rclone 的 `token`+`drive_id` 配置上传。
+以**证书签名 client_assertion** 换 Graph app-only 令牌，再把令牌喂给 rclone 的 `token` +（`drive_id` 或 `user`）配置上传。
 
 ### S3（通用：AWS / Cloudflare R2 / B2-S3 / MinIO 等，仅 endpoint 不同）
 

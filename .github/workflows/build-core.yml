@@ -123,6 +123,8 @@ jobs:
           ONEDRIVE_CERT: ${{ secrets.ONEDRIVE_CERT }}
           ONEDRIVE_KEY: ${{ secrets.ONEDRIVE_KEY }}
           ONEDRIVE_DRIVE_ID: ${{ secrets.ONEDRIVE_DRIVE_ID }}
+          ONEDRIVE_USER_ID: ${{ secrets.ONEDRIVE_USER_ID }}
+          ONEDRIVE_UPLOAD_PATH: ${{ secrets.ONEDRIVE_UPLOAD_PATH }}
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
           S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
