@@ -29,16 +29,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Cache buildx cache (含 ccache 编译缓存，按核心分支隔离)
-        uses: actions/cache@v4
-        with:
-          path: /tmp/acache
-          # 关键：key 含 ACORE_REF，使 stock(master) 与 Playerbot 分支的 ccache 缓存互相隔离，
-          # 避免切换核心后误用对方符号集的缓存导致命中混乱。mode=max 已把官方 Dockerfile 的
-          # /ccache 挂载一并导出，故 ccache 跨 run 持久化——改单个模组重跑时其余 .o 直接命中。
-          key: acore-buildx-${{ env.ACORE_REF }}-${{ hashFiles('acore-build-repo/config/modules.txt') }}
-          restore-keys: |
-            acore-buildx-${{ env.ACORE_REF }}-
+      # 构建缓存改用 buildx 原生 GHA 缓存（--cache-from/to=type=gha）。
+      # 说明：原 actions/cache + type=local 方案无法导出官方 Dockerfile 的 RUN --mount ccache
+      # 挂载内容（且 GitHub runner 为全新 VM，挂载卷本就不跨 run 存活），实际不生效；
+      # 常规无源码改动的重 build 靠 buildx 层缓存已很快，gha 缓存为 CI 最佳实践。
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -100,7 +94,7 @@ jobs:
         run: |
           cd official
           VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
-          CACHE="--cache-from=type=local,src=/tmp/acache --cache-to=type=local,mode=max,dest=/tmp/acache"
+          CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max"
           # 注：client-data target 由 build-maps.yml 的 ac-maps 镜像取代。
           #     mysql 镜像在本流程一并打包推送（ac-wotlk-mysql）；临时 build-mysql.yml 可单独触发，
           #     待部署稳定后删除 build-mysql.yml，mysql 仍由本流程产出。
@@ -119,6 +113,37 @@ jobs:
           docker tag mysql:8.4 "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:latest"
           docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4"
           docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:latest"
+
+      - name: Save core images to bundle & upload to external storage (整镜像打包)
+        # 外置储存：把整镜像打成单包传 OneDrive(E5证书)/S3(通用凭证)，部署端 docker load 后 compose up。
+        # 只保留最新版（ac-bundle-latest），多版本仍由 ghcr 承担。各后端按凭证 presence 启用、可双写。
+        env:
+          ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          ONEDRIVE_TENANT: ${{ secrets.ONEDRIVE_TENANT }}
+          ONEDRIVE_CERT: ${{ secrets.ONEDRIVE_CERT }}
+          ONEDRIVE_KEY: ${{ secrets.ONEDRIVE_KEY }}
+          ONEDRIVE_DRIVE_ID: ${{ secrets.ONEDRIVE_DRIVE_ID }}
+          ONEDRIVE_USER_ID: ${{ secrets.ONEDRIVE_USER_ID }}
+          ONEDRIVE_UPLOAD_PATH: ${{ secrets.ONEDRIVE_UPLOAD_PATH }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+        run: |
+          set -e
+          NS="ghcr.io/${{ github.repository_owner }}"
+          IMAGES="worldserver authserver db-import tools mysql"
+          # buildx --push 不会留在本地，拉回 latest 用于打包（ghcr 公开）
+          for t in $IMAGES; do docker pull "$NS/ac-wotlk-$t:latest"; done
+          # 整镜像打包为单文件
+          docker save $(for t in $IMAGES; do echo "$NS/ac-wotlk-$t:latest"; done) \
+            | zstd -T0 -o ac-bundle-latest.tar.zst
+          sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
+          # 上传（OneDrive 证书 / S3 通用，有哪个传哪个、都填都传；未配置静默跳过）
+          pip install --quiet msal 2>/dev/null || true
+          ./.github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst"
+          ./.github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst.sha256"
 
       - name: Set package visibility public (供服务器匿名 pull)
         if: always()
