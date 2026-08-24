@@ -13,7 +13,7 @@
 #
 # 依赖: rclone（CI 镜像自带 / 可 apt 安装）；msal（仅 OneDrive，python3 -m pip install msal）
 # ============================================================
-set -o pipefail
+set -euo pipefail
 
 f="$1"
 [ -f "$f" ] || { echo "upload: 文件不存在: $f" >&2; exit 1; }

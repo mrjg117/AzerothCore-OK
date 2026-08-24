@@ -20,7 +20,7 @@
 #   WORKER_BASE   本仓 Cloudflare Worker 域名（构建时烤进脚本；自定义域名可传 WORKER_BASE= 覆盖）
 #   REALM_ADDRESS / IMAGE_NS / SOAP_LOGIN / SOAP_PASSWORD / DOCKER_DB_ROOT_PASSWORD / WORK_DIR
 # ============================================================
-set -o pipefail
+set -euo pipefail
 
 WORK_DIR="${WORK_DIR:-/opt/azerothcore-ok}"
 WORKER_BASE="${WORKER_BASE:-REPLACE_WORKER_BASE}"
