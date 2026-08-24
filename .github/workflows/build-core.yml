@@ -148,8 +148,8 @@ jobs:
             command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
           fi
           pip install --quiet msal 2>/dev/null || true
-          bash .github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst"
-          bash .github/scripts/upload_artifacts.sh "ac-bundle-latest.tar.zst.sha256"
+          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
+          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
 
       - name: Set package visibility public (供服务器匿名 pull)
         if: always()

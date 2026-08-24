@@ -55,6 +55,23 @@ CI 用  **显式调用**上传脚本，不依赖文件的可执行位（）。
 > 直接执行会报 （exit 126）。用  前缀可彻底规避，无需手动 。
 > 本地手测若直接执行，记得先 。
 
+### 二之一·甲、CI checkout 路径约定（避坑）
+
+`build-core.yml` / `build-maps.yml` 的 `Checkout this repo` 步骤把本仓库 checkout 到
+**`acore-build-repo/` 子目录**（即 `${{ github.workspace }}/acore-build-repo`），而非仓库根。
+因此上传步骤（cwd 为 `${{ github.workspace }}`）调用上传脚本时**必须用绝对路径**：
+
+```yaml
+# 正确：基于 github.workspace 的绝对路径，与 build-patches 步骤写法一致
+bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
+bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
+```
+
+> 反例（会 exit 127）：`bash .github/scripts/upload_artifacts.sh ...`
+> —— 相对路径在仓库根找不到文件（实际在 `acore-build-repo/.github/scripts/` 下）。
+> 脚本内部用 `$(dirname "$0")` 定位 `onedrive_upload.py`，因此用绝对路径调用时
+> Python 脚本的相对引用也自动正确，无需额外处理。
+
 ## 二之二、CI 依赖安装（rclone 仅 S3 需要）
 
 OneDrive 走 Graph 直传（`.github/scripts/onedrive_upload.py`），**仅需 `msal`、无需 rclone**。
