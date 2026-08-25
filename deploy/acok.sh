@@ -134,6 +134,14 @@ find_history(){
   done
   return 1
 }
+get_public_ip(){
+  # 自动探测公网 IP，供部署向导默认「对外地址」使用
+  local ip=""
+  ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null)"
+  [ -z "$ip" ] && ip="$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null)"
+  [ -z "$ip" ] && ip="$(curl -fsS --max-time 5 https://icanhazip.com 2>/dev/null)"
+  printf '%s' "$ip"
+}
 load_creds(){
   local d="$1"
   [ -f "$d/.soap_creds" ] && {
@@ -233,12 +241,16 @@ wz_env(){
   local v
   # 默认值从发布的 .env.example 取（build.sh 已把 WORLD_HOST/IMAGE_NS 烤进去），
   # 避免向导显示空默认、甚至回车被 play.example.com 覆盖真值。
-  if [ -z "$REALM_ADDRESS" ] || [ -z "$IMAGE_NS" ]; then
-    _env_tpl="$(curl -fsSL --max-time 20 "$WORKER_BASE/.env.example" 2>/dev/null)"
-    [ -z "$REALM_ADDRESS" ] && REALM_ADDRESS="$(printf '%s\n' "$_env_tpl" | grep '^REALM_ADDRESS=' | cut -d= -f2-)"
-    [ -z "$IMAGE_NS" ] && IMAGE_NS="$(printf '%s\n' "$_env_tpl" | grep '^IMAGE_NS=' | cut -d= -f2-)"
+  # IMAGE_NS 默认从发布模板取（无网则回退常量）
+  if [ -z "$IMAGE_NS" ]; then
+    IMAGE_NS="$(curl -fsSL --max-time 20 "$WORKER_BASE/.env.example" 2>/dev/null | grep '^IMAGE_NS=' | cut -d= -f2-)"
   fi
-  REALM_ADDRESS="${REALM_ADDRESS:-play.example.com}"
+  # REALM_ADDRESS 默认：优先 .env 已有值 → 自动探测公网IP → 兜底占位符
+  # 用户要求：部署脚本自动获取并设置默认服务器地址，不再写死 play.example.com
+  if [ -z "$REALM_ADDRESS" ]; then
+    REALM_ADDRESS="$(get_public_ip)"
+    [ -z "$REALM_ADDRESS" ] && REALM_ADDRESS="play.example.com"
+  fi
   IMAGE_NS="${IMAGE_NS:-ghcr.io/mrjg117}"
   v="$(ask_tty "部署目录 [$DEF_WORKDIR]: " "${WORK_DIR:-$DEF_WORKDIR}")"; if maybe_back "$v"; then return 1; fi; WORK_DIR="${v:-$DEF_WORKDIR}"
   SOAP_CREDS="$WORK_DIR/.soap_creds"; DB_CREDS="$WORK_DIR/.db_creds"
@@ -554,7 +566,7 @@ fetch_bundle(){
     bn="$f"; sum="$f.sha256"
     url="$(raw_url "$bn")" || return 1
     c_info "下载 $url（aria2c 多线程 + 断点续传）..."
-    if ! aria2c -c -x16 -s16 -k1M --summary-interval=10 --console-log-level=warn \
+    if ! aria2c -c -x32 -s32 -k1M --summary-interval=10 --console-log-level=warn \
          -d "$WORK_DIR" -o "$bn" "$url"; then
       c_err "下载失败（$bn），可重试（支持断点续传）"; return 1
     fi
