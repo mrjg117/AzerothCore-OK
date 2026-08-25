@@ -550,7 +550,7 @@ raw_url(){
 # 外置存储：下载整镜像 bundle → sha256 校验 → docker load → 按 IMAGE_NS 重打标签
 fetch_bundle(){
   ensure_aria2c || return 1
-  [ -z "${EXT_STORAGE_BASE:-}" ] && { c_err "未配置外置存储源：『1 网络设置 → 外置存储源』先配置储存目录根路径"; return 1; }
+  [ -z "${EXT_STORAGE_BASE:-}" ] && { c_err "未配置外置存储源：先在『外置存储源』输入下载前缀"; return 1; }
   mkdir -p "$WORK_DIR" && cd "$WORK_DIR" || { c_err "无法进入 $WORK_DIR"; return 1; }
   local bn sum url
   for f in ac-bundle-latest.tar.zst ac-maps-latest.tar.zst; do
