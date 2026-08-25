@@ -101,18 +101,15 @@ fi
   ac-maps-latest.tar.zst.sha256
 ```
 
-`<BASE>` 即「储存目录根路径」，只填到存储目录那一层，**不含**网盘 index 的 `/api/raw?path=` 前缀。
-例如你把包放进 OneDrive 的 `acok/` 文件夹并用 cf-index 类软件挂出，则 `EXT_STORAGE_BASE=https://dro.zhbq.eu.org/acok`。
-脚本（`raw_url`）会按 `EXT_STORAGE_TYPE` 自动拼接最终直链：
-- `cfindex`（默认）：套固定结构 `<站点>/api/raw?path=<BASE 去掉主机后的 /acok>/<file>`，即 `https://dro.zhbq.eu.org/api/raw?path=/acok/ac-maps-latest.tar.zst`；
-  这类 list 网盘（cf-index-ng 等）直链统一是 `.../api/raw?path=<从储存根开始的路径>`，脚本只负责对接 `path=` 后面的部分。
-- `direct`：普通静态直链（Nginx/S3），直接 `<BASE>/<file>`。
+`<BASE>` 即「外置储存下载前缀」，你输入**完整下载前缀**（含网盘 index 的 `/api/raw?path=` 结构），
+脚本把自身生成的文件名直接拼到后面。例如 `EXT_STORAGE_BASE=https://dro.zhbq.eu.org/api/raw?path=/acok/`，
+则 bundle 最终直链 = `https://dro.zhbq.eu.org/api/raw?path=/acok/ac-bundle-latest.tar.zst`。
+本地路径同理：`EXT_STORAGE_BASE=/srv/acok/` → `/srv/acok/ac-maps-latest.tar.zst`。
 
 ## 四、部署侧：启用外置
 
-运行 `acok.sh` → `1) 网络设置` → `2) 配置外置存储源` → 输入储存目录根路径（如 `https://dro.zhbq.eu.org/acok` 或本地 `/srv/acok`）。
-可选 `3) 切换外置存储形态` 在 `cfindex` / `direct` 间切换（默认 `cfindex`）。
-脚本写入 `.env` 的 `DEPLOY_SRC=external` / `EXT_STORAGE_BASE=...` / `EXT_STORAGE_TYPE=...`。之后安装/重部署会：
+运行 `acok.sh` → `1) 网络设置` → `2) 配置外置存储源` → 输入完整下载前缀（如 `https://dro.zhbq.eu.org/api/raw?path=/acok/` 或本地 `/srv/acok/`）。
+脚本写入 `.env` 的 `DEPLOY_SRC=external` / `EXT_STORAGE_BASE=...`。之后安装/重部署会：
 
 1. 仍从 Worker 拉取**小型配置文件**（`docker-compose.yml` / `.env` / `env.ac`）；
 2. 用 **aria2c**（外置模式下若未装则自动安装）多线程下载两个 `*.tar.zst`；
@@ -121,4 +118,4 @@ fi
 
 ## 五、回退
 
-`1) 网络设置 → 外置存储源 → 1) 切换为 ghcr 直连` 即切回原流程。
+切回 ghcr 直连：在外置存储源菜单把前缀清空（或直接在 `.env` 删掉 `EXT_STORAGE_BASE=` 一行）并重跑 `acok.sh` 即可恢复 ghcr 拉取。

@@ -32,9 +32,8 @@ SOAP_CREDS="$WORK_DIR/.soap_creds"
 DB_CREDS="$WORK_DIR/.db_creds"
 SOAP_LOGIN=""; SOAP_PASSWORD=""; DB_PW=""; REALM_ADDRESS=""; IMAGE_NS=""; GM_NAME=""; GM_PASS=""
 # 外置储存部署状态（DEPLOY_SRC=ghcr | external）
-# EXT_STORAGE_BASE = 用户自定义的「储存目录根路径」（只到存储目录，如 https://dro.zhbq.eu.org/acok 或本地 /srv/acok）
-# EXT_STORAGE_TYPE = 外置存储形态：cfindex（默认，套 /api/raw?path= 固定结构）| direct（普通静态直链 <base>/<file>）
-EXT_STORAGE_BASE=""; EXT_STORAGE_TYPE="cfindex"; AC_VERSION=""; DEPLOY_SRC="ghcr"
+# EXT_STORAGE_BASE = 用户自定义的「外置储存下载前缀」（如 https://dro.zhbq.eu.org/api/raw?path=/acok/ 或本地 /srv/acok/，脚本自动拼文件名）
+EXT_STORAGE_BASE=""; AC_VERSION=""; DEPLOY_SRC="ghcr"
 # 整镜像 bundle 的源命名空间（与 CI 推送所用 repository_owner 一致；部署端 docker load 后按 IMAGE_NS 重打标签）
 BUNDLE_NS="ghcr.io/mrjg117"
 PROXY=""
@@ -147,8 +146,6 @@ load_creds(){
     [ -z "$IMAGE_NS" ] && IMAGE_NS="$(grep '^IMAGE_NS=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
     [ -z "$DEPLOY_SRC" ] && DEPLOY_SRC="$(grep '^DEPLOY_SRC=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
     [ -z "$EXT_STORAGE_BASE" ] && EXT_STORAGE_BASE="$(grep '^EXT_STORAGE_BASE=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
-    [ -z "$EXT_STORAGE_TYPE" ] && EXT_STORAGE_TYPE="$(grep '^EXT_STORAGE_TYPE=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
-    [ -z "$EXT_STORAGE_TYPE" ] && EXT_STORAGE_TYPE="cfindex"
     [ -z "$AC_VERSION" ] && AC_VERSION="$(grep '^AC_VERSION=' "$d/.env" 2>/dev/null | cut -d= -f2-)"
   }
 }
@@ -187,31 +184,20 @@ set_proxy(){
 }
 ext_storage_menu(){
   while true; do
-    echo; echo "=== 2 外置存储源（整镜像包下载，免 ghcr 拉取）==="
-    echo "当前: $([ "${DEPLOY_SRC:-ghcr}" = external ] && echo "外置(${EXT_STORAGE_BASE:-未配置})" || echo "ghcr 直连")"
-    echo "1) 切换为 ghcr 直连（默认）"
-    echo "2) 切换为外置存储（输入储存目录根路径）"
-    echo "3) 切换外置存储形态（当前: ${EXT_STORAGE_TYPE:-cfindex}）"
-    echo "q) 返回"
-    local c; c="$(ask '存储> ')"; case "$c" in
-      1) DEPLOY_SRC=ghcr; set_env DEPLOY_SRC ghcr; c_ok "已切回 ghcr 直连";;
-      2)
-        local b
-        b="$(ask_tty '储存目录根路径（只填到存储目录，如 https://dro.zhbq.eu.org/acok 或本地 /srv/acok）: ' "${EXT_STORAGE_BASE:-}")"
-        [ -n "$b" ] && {
-          EXT_STORAGE_BASE="${b%/}"; DEPLOY_SRC=external
-          [ -z "${EXT_STORAGE_TYPE:-}" ] && EXT_STORAGE_TYPE="cfindex"
-          set_env EXT_STORAGE_BASE "$EXT_STORAGE_BASE"
-          set_env EXT_STORAGE_TYPE "$EXT_STORAGE_TYPE"
-          set_env DEPLOY_SRC external
-          c_ok "已启用外置存储: $EXT_STORAGE_BASE（形态=$EXT_STORAGE_TYPE；脚本只负责对接从此目录开始的相对路径，如 /acok/ac-maps-latest.tar.zst）"
-        };;
-      3)
-        if [ "${EXT_STORAGE_TYPE:-cfindex}" = "cfindex" ]; then EXT_STORAGE_TYPE=direct; else EXT_STORAGE_TYPE=cfindex; fi
-        set_env EXT_STORAGE_TYPE "$EXT_STORAGE_TYPE"
-        c_ok "外置存储形态已切为 $EXT_STORAGE_TYPE（cfindex=套 /api/raw?path= 结构；direct=普通静态直链）" ;;
-      q|Q) break;;
-      *) c_warn "无效选择";;
+    echo; echo "=== 外置存储源（整镜像包下载，免 ghcr 拉取）==="
+    echo "当前前缀: ${EXT_STORAGE_BASE:-未配置}"
+    local b
+    b="$(ask_tty '输入外置储存前缀（如 https://dro.zhbq.eu.org/api/raw?path=/acok/，脚本自动拼文件名；q 返回）: ' "${EXT_STORAGE_BASE:-}")"
+    case "$b" in
+      q|Q) break ;;
+      "")
+        c_warn "未输入，请重新输入（或输入 q 返回）" ;;
+      *)
+        EXT_STORAGE_BASE="${b%/}"
+        DEPLOY_SRC=external
+        set_env EXT_STORAGE_BASE "$EXT_STORAGE_BASE"
+        set_env DEPLOY_SRC external
+        c_ok "已配置外置储存前缀: $EXT_STORAGE_BASE" ;;
     esac
   done
 }
@@ -552,43 +538,13 @@ fix_env_perms(){
   fi
 }
 
-# 外置存储 URL 桥接：把「用户只输入到储存目录的路径」翻译成最终可下载直链。
-# 设计边界（用户明确）：
-#   - EXT_STORAGE_BASE = 用户自定义的「储存目录根路径」，脚本只负责对接从这里开始的相对路径，
-#     前面站点的网站/域名/CDN 一律不管（如 https://dro.zhbq.eu.org/acok 或本地 /srv/acok）。
-#   - 这类网盘 index（cf-index-ng 等）的直链都是固定结构： <站点>/api/raw?path=<从储存根开始的路径>
-#     脚本只拼 path= 后面的部分（即 EXT_STORAGE_BASE 去掉协议主机后那段），前面 /api/raw?path= 是固定结构。
-#   - 普通 http 直链站（如 Nginx/S3 静态根）没有 /api/raw 概念，直接 <base>/<file>。
-# 入参：$1 = 文件名（相对储存目录，如 ac-maps-latest.tar.zst）
-# 类型由 EXT_STORAGE_TYPE 控制（默认 cfindex）：
-#   cfindex —— 套 <host>/api/raw?path=<储存目录路径>/<file> 固定结构（list 类网盘通用）
-#   direct  —— 直接 <base>/<file>（Nginx/S3 等静态直链）
+# 外置存储 URL 桥接：用户只输入下载前缀（如 https://dro.zhbq.eu.org/api/raw?path=/acok/ 或本地 /srv/acok/），
+# 脚本把自身生成的文件名（ac-maps-latest.tar.zst 等）直接拼到后面，不做任何形态判断。
+# 入参：$1 = 文件名（如 ac-maps-latest.tar.zst）
 raw_url(){
   local base="${EXT_STORAGE_BASE%/}" f="$1"
-  local stype="${EXT_STORAGE_TYPE:-cfindex}"
-  [ -z "$base" ] && { c_err "未配置外置存储源：『1 网络设置 → 外置存储源』先配置储存目录根路径"; return 1; }
-  # 本地路径（以 / 开头且非 http）：直接拼本地路径，不走网络
-  case "$base" in
-    /*) printf '%s/%s' "$base" "$f"; return 0 ;;
-  esac
-  # 抽 protocol://host，剩 /acok 这段作为 path 值
-  local proto_host path_part
-  proto_host="$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#')"
-  path_part="$(printf '%s' "$base" | sed -E 's#^https?://[^/]+##')"
-  case "$path_part" in
-    /*) ;; *) path_part="/$path_part" ;;
-  esac
-  case "$stype" in
-    direct)
-      printf '%s/%s' "$base" "$f" ;;
-    cfindex|*)
-      # 用户若已把 /api/raw?path= 完整形态传进来（少见），原样追加 file 防重复
-      if printf '%s' "$base" | grep -q '/api/raw'; then
-        printf '%s%s' "$base" "$f"
-      else
-        printf '%s/api/raw?path=%s/%s' "$proto_host" "$path_part" "$f"
-      fi ;;
-  esac
+  [ -z "$base" ] && { c_err "未配置外置存储源：先在『外置存储源』输入下载前缀"; return 1; }
+  printf '%s/%s' "$base" "$f"
 }
 
 # 外置存储：下载整镜像 bundle → sha256 校验 → docker load → 按 IMAGE_NS 重打标签
