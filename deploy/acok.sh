@@ -36,7 +36,6 @@ SOAP_LOGIN=""; SOAP_PASSWORD=""; DB_PW=""; REALM_ADDRESS=""; IMAGE_NS=""; GM_NAM
 EXT_STORAGE_BASE=""; AC_VERSION=""; DEPLOY_SRC="ghcr"
 # 整镜像 bundle 的源命名空间（与 CI 推送所用 repository_owner 一致；部署端 docker load 后按 IMAGE_NS 重打标签）
 BUNDLE_NS="ghcr.io/mrjg117"
-PROXY=""
 # 默认值常量（提示语括号显示用，非历史当前值）。以本文件 SPEC.md 第 0 节为准。
 DEF_WORKDIR="/opt/azerothcore-ok"; DEF_REALM="play.example.com"; DEF_NS="ghcr.io/mrjg117"
 
@@ -79,6 +78,7 @@ confirm(){
 set_env(){
   # set_env KEY VALUE：写入/更新 $WORK_DIR/.env 的 KEY=VALUE（纯 bash，不依赖 sed/mktemp）
   local key="$1" val="$2" f="$WORK_DIR/.env" tmp
+  mkdir -p "$(dirname "$f")"
   if [ ! -f "$f" ]; then printf '%s=%s\n' "$key" "$val" > "$f"; return 0; fi
   tmp="$f.tmp.$$"
   while IFS= read -r line; do
@@ -163,24 +163,21 @@ require_workdir(){
   return 0
 }
 
-# ---------- 1 网络设置 ----------
+# ---------- 1 网络设置（部署源：ghcr 直连 / 外置存储）----------
 net_menu(){
   while true; do
-    echo; echo "=== 1 网络设置 ==="
-    echo "1) 设置临时代理（仅本次会话）"
-    echo "2) 配置外置存储源（整镜像包下载，免 ghcr 拉取）"
+    echo; echo "=== 1 网络设置（部署源）==="
+    echo "当前部署源: $([ "${DEPLOY_SRC:-ghcr}" = external ] && echo "外置(${EXT_STORAGE_BASE:-未配置})" || echo "ghcr 直连")"
+    echo "1) 部署源：ghcr 直连（默认）"
+    echo "2) 部署源：外置存储（输入下载前缀）"
     echo "q) 返回主菜单"
     local c; c="$(ask '网络> ')"; case "$c" in
-      1) set_proxy;;
+      1) DEPLOY_SRC=ghcr; EXT_STORAGE_BASE=""; set_env DEPLOY_SRC ghcr; set_env EXT_STORAGE_BASE ""; c_ok "已设为 ghcr 直连" ;;
       2) ext_storage_menu;;
       q|Q) break;;
       *) c_warn "无效选择";;
     esac
   done
-}
-set_proxy(){
-  local p; p="$(ask '输入代理地址(如 http://127.0.0.1:7890，留空取消): ')"
-  if [ -n "$p" ]; then export http_proxy="$p" https_proxy="$p"; PROXY="$p"; c_ok "本次会话已设置代理 $p"; else unset http_proxy https_proxy; PROXY=""; c_info "已清除代理"; fi
 }
 ext_storage_menu(){
   while true; do

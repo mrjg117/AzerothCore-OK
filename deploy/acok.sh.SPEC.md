@@ -69,8 +69,8 @@
 
 | 输入 | 函数 |
 |---|---|
-| `1` | `set_proxy` —— 输入代理地址（如 `http://127.0.0.1:7890`，留空取消）；设 `http_proxy`/`https_proxy` 仅本次会话 |
-| `2` | `select_mirror` |
+| `1` | 部署源设为 `ghcr` 直连（写 `DEPLOY_SRC=ghcr`，清空 `EXT_STORAGE_BASE`） |
+| `2` | `ext_storage_menu` —— 输入外置储存前缀，写 `EXT_STORAGE_BASE`+`DEPLOY_SRC=external` |
 | `q` | 返回主菜单 |
 
 ### 3.1 选择 ghcr 镜像源（select_mirror，循环）
