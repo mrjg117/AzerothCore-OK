@@ -1,15 +1,17 @@
 name: build-static-verify
 
 # 新建流程（不动 build-core.yml）。
-# 门控模型（按用户三点要求）：
+# 门控模型（按用户要求）：
 #   - 编译门：官方 docker buildx 整体静态编译（core+40模块）。任何编译报错都算失败（最终必须整体无错）；
 #     失败 → 停在编译门，不进部署（needs 链阻断 deploy-test / package，编坏无镜像可测）。
 #   - 部署门：仅编译干净才跑（needs: build）。官方 compose up 起全栈，grep 收全 db-import / worldserver 错误，
-#     任一有错 → 停部署门，不打包。
+#     任一有错 → 停部署门，不冻库、不打包。
 #   - 打包：仅两门都干净才跑（needs: [build, deploy-test]）。
 #   = 即「编译出错编译完成前停查一遍错 → 再测部署 → 部署出错再查部署 → 都干净才完成打包」；每道门内收全错误。
 # 「参照以前」= build 步与 package 步原样复用 build-core.yml 的 clone/40模块/Apply build-patches/CMODULES=static/push/bundle+upload。
 # 「一切用官方流程」= 不替换官方 Dockerfile/compose/db-import；仅在官方流程之上叠错误暴露（grep 日志），官方流程完整还原。
+# 「一个大包」= 用户要求：五个主镜像 + 地图(ac-maps) + 配置(ac-extra-config) + 冻好的数据库，全并进 ac-bundle-latest.tar.zst，
+#   用户机下载 → docker load → 解压数据库进卷 → compose up = 满状态，不另拉、不重导。
 
 on:
   workflow_dispatch:
@@ -128,7 +130,8 @@ jobs:
   #   - worldserver 等 "WORLD Initialized"，再 grep ABORT/Could not prepare/Table ... doesn't exist
   #   同时检测「镜像缺失/容器未起来」（拉镜像失败即 exit 1；db-import 未退出/worldserver 未初始化也判 FAIL），杜绝假阴性。
   #   所有命中先打印、累计 FAIL 标志，最后统一判定（不中途退，保证全部错误都暴露）
-  # 任一 FAIL>0 → 本 job 失败 → 停部署门，package 被 needs 链阻断（不打包）
+  # 任一 FAIL>0 → 本 job 失败 → 停部署门，package 被 needs 链阻断（不冻库、不打包）
+  # 部署门干净 → 冻库（方案B：优雅停库→拷数据目录→压缩）→ 作为 artifact 传给 package 并进大包
   # =========================================================================
   deploy-test:
     needs: build
@@ -238,18 +241,45 @@ jobs:
           [ "$WS_INIT" = "1" ] || { echo "!! worldserver 未在超时内初始化（可能崩溃/配置错）"; FAIL=1; }
           echo "WS_FAIL=$FAIL" >> "$GITHUB_ENV"
 
-      - name: Deploy-test gate (FAIL>0 → 暴露全部错误并标红，不向下打包)
+      - name: Deploy-test gate (FAIL>0 → 暴露全部错误并标红，不冻库不打包)
         if: always()
         run: |
           D="${DBIMPORT_FAIL:-0}"; W="${WS_FAIL:-0}"
           echo "db-import FAIL=$D  worldserver FAIL=$W"
           if [ "$D" != "0" ] || [ "$W" != "0" ]; then
-            echo "!! 部署门暴露错误：db-import=$D worldserver=$W —— 停部署门，不打包"
+            echo "!! 部署门暴露错误：db-import=$D worldserver=$W —— 停部署门，不冻库不打包"
             exit 1
           fi
           echo "部署门无错误"
 
-      - name: Tear down
+      - name: Freeze database (方案B：优雅停库→拷数据目录→压缩) 仅部署门干净才到这
+        if: success()
+        run: |
+          cd official
+          CF="apps/docker/docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          echo "== graceful stop ac-database =="
+          docker compose -f $CF stop ac-database
+          for i in $(seq 1 30); do
+            if [ -z "$(docker compose -f $CF ps ac-database --status running -q 2>/dev/null)" ]; then echo "db stopped"; break; fi
+            sleep 2
+          done
+          CID=$(docker compose -f $CF ps -q ac-database)
+          echo "db container id=$CID"
+          mkdir -p /tmp/dbdata
+          docker cp "$CID:/var/lib/mysql/." /tmp/dbdata/
+          tar -cf "${{ github.workspace }}/ac-db-data.tar.zst" -I zstd -C /tmp/dbdata .
+          ls -lh "${{ github.workspace }}/ac-db-data.tar.zst"
+
+      - name: Upload frozen DB as artifact (供 package 并入大包)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ac-db-data
+          path: ${{ github.workspace }}/ac-db-data.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Tear down (数据已冻进 artifact，此处可删卷)
         if: always()
         run: |
           cd official
@@ -257,12 +287,13 @@ jobs:
             -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" down -v || true
 
   # =========================================================================
-  # package（needs: [build, deploy-test] → 两门都干净才跑；原样复用 build-core.yml 的 bundle/upload 步）
+  # package（needs: [build, deploy-test] → 两门都干净才跑；原样复用 build-core.yml 的 bundle/upload 步，
+  #   并把地图(ac-maps) + 配置(ac-extra-config) + 冻好的数据库(ac-db-data.tar.zst) 一并并进同一个大包）
   # =========================================================================
   package:
     needs: [build, deploy-test]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: GATE — 确认两门干净才打包
         run: |
@@ -281,7 +312,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Save core images to bundle & upload to external storage
+      - name: Download frozen DB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ac-db-data
+          path: ${{ github.workspace }}
+
+      - name: Pull all 7 images (5 主镜像 + ac-maps + ac-extra-config)
+        run: |
+          set -e
+          NS="ghcr.io/${{ github.repository_owner }}"
+          for t in worldserver authserver db-import tools mysql ac-maps ac-extra-config; do
+            docker pull "$NS/ac-wotlk-$t:latest"
+          done
+
+      - name: Save all images + frozen DB into one big bundle
         env:
           ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
           ONEDRIVE_TENANT: ${{ secrets.ONEDRIVE_TENANT }}
@@ -298,11 +343,14 @@ jobs:
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
-          IMAGES="worldserver authserver db-import tools mysql"
-          for t in $IMAGES; do docker pull "$NS/ac-wotlk-$t:latest"; done
-          docker save $(for t in $IMAGES; do echo "$NS/ac-wotlk-$t:latest"; done) \
-            | zstd -T0 -o ac-bundle-latest.tar.zst
+          IMAGES="worldserver authserver db-import tools mysql ac-maps ac-extra-config"
+          mkdir -p /tmp/bundle
+          docker save $(for t in $IMAGES; do echo "$NS/ac-wotlk-$t:latest"; done) -o /tmp/bundle/images.tar
+          cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
+          ls -lh /tmp/bundle/
+          tar -cf ac-bundle-latest.tar.zst -I zstd -C /tmp/bundle .
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
+          ls -lh ac-bundle-latest.tar.zst
           if [ -n "$S3_BUCKET" ]; then
             curl -sSfL https://rclone.org/install.sh | sudo bash
             command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }

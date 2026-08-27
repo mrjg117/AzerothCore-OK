@@ -18,8 +18,8 @@
 ## 2. 参照以前（复用 build-core.yml，不另起炉灶）
 build 与 package 两阶段直接搬 `build-core.yml` 的真实步：
 - **编译**：`clone Playerbot fork @Playerbot` → 按 `config/modules.txt` 拉 40 模块（去 `-master` 后缀）→ `Apply build-patches`（沿用现有约定：`*.patch` 走 `git apply`，失败回退 `patch -p1`；`*.sh` 在目标目录执行；`overlay/` 整目录覆盖）→ `docker buildx ... --target <t> -f apps/docker/Dockerfile --build-arg CMODULES=static --push`（worldserver/authserver/db-import/tools 四 target）→ 拉 `mysql:8.4` 打 tag 推 `ac-wotlk-mysql`。
-- **打包**：`docker save` 五个镜像 → `zstd` 成 `ac-bundle-latest.tar.zst`(+`.sha256`) → `.github/scripts/upload_artifacts.sh` 传外置储存（OneDrive 证书 / S3 凭证，有哪个传哪个）→ 设 ghcr 公开 → prune 保留最新 12 版。
-- 注意：**地图（ac-maps）与额外配置（ac-extra-config）不进 bundle**，由部署端另行 pull（同 build-core.yml 约定，maps 走 `build-maps.yml`）。bundle 只含 worldserver/authserver/db-import/tools/mysql 五个。
+- **打包**：`docker save` 七个镜像 → 与 `ac-db-data.tar.zst`(冻好的数据库) 一并 `tar -I zstd` 成 `ac-bundle-latest.tar.zst`(+`.sha256`) → `.github/scripts/upload_artifacts.sh` 传外置储存（OneDrive 证书 / S3 凭证，有哪个传哪个）→ 设 ghcr 公开 → prune 保留最新 12 版。
+- **一个大包（用户明确要求「不另拉」）**：bundle = 五个主镜像(worldserver/authserver/db-import/tools/mysql) + 地图(ac-maps) + 配置(ac-extra-config) + 冻好的数据库(`ac-db-data.tar.zst`)。用户机下载后 `docker load` + 解压数据库进卷 + `compose up` = 满状态，不另拉镜像、不重导数据。
 
 ## 3. 一切用官方流程（尽量完整还原，不偷改）
 - **静态是官方默认**：`config.cmake` 里 `set(MODULES "static")` 即官方默认；官方 Dockerfile `ARG CMODULES="static"`。动态需补 `COPY --from=build .../*.so`，反而要改官方 Dockerfile → 选静态。
@@ -36,6 +36,14 @@ R1–R5（已在 192.168.10.99 服务端**手工**修复，但**未固化进仓�
 - **R5**：mod-item-affixes 版本漂移，`mythic_plus_level` 缺 `random_affix_count` 列。
 - **worldserver 侧**：`ABORT / Could not prepare / Table ... doesn't exist / Unknown column / WORLD NOT Initialized` 也要 grep。
 - **关键**：deploy-test 的 grep 步骤 `if: always()` 且**累计 FAIL、最后统一判定**，保证所有错误一次列全。
+
+## 4.5 冻库（方案B）与用户机部署（本次新增）
+- **冻库方式 = 方案B（冷拷数据目录）**：部署门干净后，`docker compose stop ac-database` 优雅停库 → `docker cp` 拷出 `/var/lib/mysql` 整个目录 → `tar -I zstd` 压成 `ac-db-data.tar.zst` → 作为 artifact 传给 package 并进大包。
+- **为什么选 B 而非 A**：大包已含 `ac-wotlk-mysql:8.4` 镜像，用户机 MySQL 版本与云上完全一致，B 的「版本绑定」副作用被消除；用户机 load 后直接挂上即可，**零重导**（A 还需多一条还原命令）。若日后用户换 MySQL 大版本，再退回 A（mysqldump）兜底。
+- **大包内容**：`ac-bundle-latest.tar.zst` = 7 个镜像(worldserver/authserver/db-import/tools/mysql/ac-maps/ac-extra-config) 的 `docker save` tar + `ac-db-data.tar.zst`。
+- **用户机部署步骤（极简）**：① `docker load` 大包里的 images.tar；② 把 `ac-db-data.tar.zst` 解压进 mysql 数据卷（**解压≠重导**，秒级，不跑 SQL）；③ `compose up`。db-import 检测到库已存在会自动跳过，不重复导。
+- **偏离官方之处（用户明确要求）**：官方每次 `compose up` 都重跑 db-import 导数据；本流程改为「云上导一次、冻进包、用户机免导」。官方流程仍用于云上「构建+测试+验证」阶段（db-import 照跑、照抓错），只改了「交付物」形态。
+- **体积预警**：ac-maps 约 3.24GB + 数据库若干 GB，大包可能 7–9GB，上传/下载耗时，属预期。
 
 ## 5. 首跑前置（必看，否则部署门直接挂）
 - 镜像仓库先有 `ac-maps:latest`（先跑一次 `build-maps.yml`）和 `ac-extra-config:latest`，否则 `compose up` 拉不到、部署门挂。
