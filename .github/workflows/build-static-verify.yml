@@ -125,34 +125,35 @@ jobs:
 
       - name: Bring up stack (官方部署)
         run: |
-          set -e
           cd "${{ github.workspace }}/official"
           # --no-build：用刚编好的本地镜像起栈；mysql:8.4 / client-data(从 wowgaming 拉地图) 按官方现场来
-          docker compose up -d --no-build
+          # 注意：db-import/worldserver 任一退出非零，compose up 会返回非0；此处用 || 接住，
+          #       不让整步 abort，交下一步抓取容器日志、扫描致命错误（符合“部署错全扫、暴露全部”）。
+          docker compose up -d --no-build || echo "!! docker compose up 返回非零（有服务未正常起/退出），交下一步抓日志"
           docker compose ps
 
       - name: Expose deployment errors (db-import + worldserver；收全不早退)
-        if: success()
         run: |
           set -e
           cd "${{ github.workspace }}/official"
           FAIL=0
-          # ---- db-import ----
-          DI_SEEN=0
-          for i in $(seq 1 120); do
-            if docker compose ps ac-db-import --status exited -q >/dev/null 2>&1; then DI_SEEN=1; break; fi
-            sleep 5
-          done
+          # ---- db-import（一次性任务，exit 非0 即失败）----
           docker compose logs ac-db-import > /tmp/dbimport.log 2>&1 || true
-          echo "==== db-import log tail ===="; tail -n 50 /tmp/dbimport.log
-          if [ "$DI_SEEN" != "1" ]; then echo "!! db-import 未退出（镜像缺失/卡死/编排错误）"; FAIL=1; fi
-          if grep -Ei 'Unhandled|errno [0-9]|does not exist|Duplicate entry|truncated for column|Unexpected behaviour|ERROR [0-9]' /tmp/dbimport.log; then
-            echo "!! db-import 暴露错误（含带病 exit 0）"; FAIL=1
+          echo "==== db-import log (FULL) ===="; cat /tmp/dbimport.log
+          DI_RC=$(docker inspect -f '{{.State.ExitCode}}' ac-db-import 2>/dev/null || echo "NA")
+          echo "ac-db-import exit code = $DI_RC"
+          if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then
+            echo "!! ac-db-import 异常退出($DI_RC)"; FAIL=1
           fi
+          if grep -Eqi 'ERROR|Unhandled|errno|does not exist|Duplicate entry|truncated|Unexpected|ABORT|FATAL|failed|refused|cannot' /tmp/dbimport.log; then
+            echo "!! db-import 日志含错误关键字"; FAIL=1
+          fi
+          # db-import 失败则 worldserver 依赖它不会起，直接判停（不必再空等 worldserver）
+          if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误（db-import），停（不冻库不打包）"; exit 1; fi
           # ---- worldserver ----
           WS_SEEN=0
           for i in $(seq 1 120); do
-            docker compose ps ac-worldserver --status running -q >/dev/null 2>&1 && WS_SEEN=1
+            docker compose ps ac-worldserver --status running -q >/dev/null 2>&1 && WS_SEEN=1 && break
             sleep 5
           done
           if [ "$WS_SEEN" != "1" ]; then echo "!! worldserver 容器未运行（启动失败/崩溃）"; FAIL=1; fi

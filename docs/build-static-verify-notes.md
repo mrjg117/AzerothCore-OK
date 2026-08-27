@@ -13,12 +13,12 @@
   1. Clone 官方核心 `mod-playerbots/azerothcore-wotlk` @`Playerbot`
   2. 挂 `config/modules.txt` 的 40 模组 + `apply build-patches/`（项目侧输入）
   3. 准备 etc 配置（叠仓库模组 conf，核心 conf 用官方默认）
-  4. `docker compose build --profile tools`（官方编译；**跑完暴露全部错误，有错才停在打包前——不是出错马上停**）
+  4. `docker compose --profile tools build`（官方编译；**跑完暴露全部错误，有错才停在打包前——不是出错马上停**。`--profile tools` 是 compose v2 全局 flag，必须放 `docker compose` 后、`build` 前）
   5. `docker compose up -d --no-build`（官方部署；**跑完暴露全部错误，有错才停在打包前——不是出错马上停**）
   6. grep 暴露 db-import / worldserver 错误（**全量扫、不早退、不 break，最后统一判定**）
   7. 全干净才 `docker compose stop` 冻库 + 打包 + 上传
 - 段间"有错不进打包"：build/up 任一步非零退出 → 后续 `if: success()` 步全不跑（不冻库不打包），日志全暴露。**这是"步骤跑完它的正常流程后再判定停"，不是"一出错就掐断"**——用户原话："暴漏全部错误，彻底完成前一步停，不想再有错误的情况下完成"。
-- 段内"收全错误"：编译门各服务独立 build，且 core build-patch(keep_going.sh) 已给 `cmake --build` 加 `-- -k` 透传 make，单服务内遇错继续编译、暴露全部模组错误（未加补丁前官方不带 -k 只报第一个）；部署门 grep 累计 FAIL、最后统一判定，worldserver 循环不 break、全量扫日志。
+- 段内"收全错误"：编译门各服务独立 build，且 core build-patch(keep_going.sh) 已给 `cmake --build` 加 `-- -k 0` 透传 ninja（官方 Dockerfile 用 Ninja 生成器，`-k` 必须带数字 `0`=无限继续，空 `-k` 会报 `option requires an argument`），单服务内遇错继续编译、暴露全部模组错误（未加补丁前官方不带 -k 只报第一个）；部署门 grep 累计 FAIL、最后统一判定，worldserver 循环不 break、全量扫日志。
 
 ## 2. 不碰 ghcr（分发靠 tarball，不靠 registry）
 - 砍掉历史上 login/push/pull ghcr 的全部逻辑。build 编译出的镜像留在本地 runner，deploy 用 `--no-build` 直接起；package 用 `docker save` 本地镜像打 tarball。
@@ -29,7 +29,7 @@
 ## 3. 一切用官方流程（完整还原,不偷改）
 - **静态是官方默认**：官方 Dockerfile `ARG CMODULES="static"`（第 51 行），本工作流不覆盖、不传参。
 - **官方标准流程** = `docker compose build` + `docker compose up -d`；`db-import` 是一次性 init 容器,随 `up` 自动跑、跑完即 `exited`；`ac-client-data-init` 按官方 `target: client-data` 从 wowgaming 拉地图填卷。本工作流完全照此,没替换官方 Dockerfile / compose / db-import。
-- **已核实事实（2026-08-27）**：`mod-playerbots/azerothcore-wotlk` @`Playerbot` 根目录**无 `.gitmodules`** → 官方 clone **不需要 `--recursive`**（无 git submodule 依赖）；官方 Dockerfile 编译用 `cmake --build . --config "$CTYPE" -j $(($(nproc)+1))`（**不带 `-k`**），故单服务内编译错只报第一个是官方行为——此限制已由 `build-patches/core/keep_going.sh` 加 `-- -k` 补丁消除。
+- **已核实事实（2026-08-27）**：`mod-playerbots/azerothcore-wotlk` @`Playerbot` 根目录**无 `.gitmodules`** → 官方 clone **不需要 `--recursive`**（无 git submodule 依赖）；官方 Dockerfile 编译用 `cmake --build . --config "$CTYPE" -j $(($(nproc)+1))`（**不带 `-k`**），故单服务内编译错只报第一个是官方行为——此限制已由 `build-patches/core/keep_going.sh` 加 `-- -k 0`（ninja 透传）补丁消除。
 - **数据持久化走官方卷**：数据库卷、地图卷由官方 compose 声明；CI 测完即 `down -v` 拆卷。数据库在部署门干净后**冻进 bundle(方案B：冷拷 `/var/lib/mysql` 数据目录,见 §4.5)**,用户机解压进卷即满状态、免导——这是用户要求的「一个大包直接部署」交付形态,与官方"每次 up 重跑 db-import"不同,但官方流程仍用于云上构建+测试+抓错阶段。
 - **动态 vs 静态**：SQL 处理两者等价(都靠 db-import 镜像携带 `modules/`)→ 选静态不影响 SQL 正确性。
 
@@ -42,6 +42,7 @@ R1–R5(已在 192.168.10.99 服务端**手工**修复,但**未固化进仓库**
 - **R5**：mod-item-affixes 版本漂移,`mythic_plus_level` 缺 `random_affix_count` 列。
 - **worldserver 侧**：全量 grep 致命错误（`ABORT / Could not prepare / Table ... doesn't exist / Unknown column / Segmentation / SIGSEGV / FATAL / panic / refused to start / cannot (load|open) / failed to initialize` 等）。**不早退、不 break、循环扫全日志**；容器 running 只是前提，**必须日志无致命错误才判成功**（running 但内部崩不算过）。不强制 "WORLD Initialized" 关键字,避免误判。
 - **关键**：deploy 验证步 `if: success()` 且**累计 FAIL、最后统一判定**,保证所有错误一次列全。
+- **R6（2026-08-28 暴露的设计坑）**：`docker compose up -d` 因依赖服务（db-import）退出非零会返回非 0，若 step 9 用 `set -e` 会整步 abort，导致 step 10（抓容器日志、扫描致命错误）被 `if: success()` 跳过——**db-import 内部真正的 SQL 报错看不到**。修复：step 9 用 `docker compose up -d --no-build || echo ...` 接住非零返回、不让整步 aborted；step 10 **去掉 `if: success()` 始终执行**，先 `docker inspect` 取 `ac-db-import` 真实 exit code + `cat` 打印其**完整日志** + 宽 grep 错误关键字，db-import 失败即立即判停（worldserver 依赖它不会起、不必空等）；仅 db-import 干净才继续 worldserver 检查。这样部署错真正全暴露。
 
 ## 4.5 冻库(方案B)与用户机部署
 - **冻库方式 = 方案B(冷拷数据目录)**：部署门干净后,`docker compose stop ac-database` 优雅停库 → `docker cp` 拷出 `/var/lib/mysql` 整个目录 → `tar -I zstd` 压成 `ac-db-data.tar.zst` → 并进大包。
@@ -60,7 +61,7 @@ R1–R5(已在 192.168.10.99 服务端**手工**修复,但**未固化进仓库**
 ## 6. 不要做的事(铁律)
 - 不要改 `build-core.yml`(新建独立工作流)。
 - 不要加 `do_publish` 之类的开关(打包应"全干净自动发生")。
-- 不要替换官方 Dockerfile / compose / db-import(只在上面叠 grep 错误暴露)。**编译"暴漏全部错误"已由 `build-patches/core/keep_going.sh` 补丁实现:给官方 `cmake --build . --config "$CTYPE" -j N` 追加 `-- -k` 透传 make 遇错继续,暴露全部模组错误;不改官方 Dockerfile 本体,走项目侧 build-patch 机制。**
+- 不要替换官方 Dockerfile / compose / db-import(只在上面叠 grep 错误暴露)。**编译"暴漏全部错误"已由 `build-patches/core/keep_going.sh` 补丁实现:给官方 `cmake --build . --config "$CTYPE" -j N` 追加 `-- -k 0` 透传 ninja(官方用 Ninja 生成器，`-k` 必须带数字)遇错继续,暴露全部模组错误;不改官方 Dockerfile 本体,走项目侧 build-patch 机制。**
 - 不要碰 ghcr(分发靠 tarball,不靠 registry)。
 - repo 改动(item-affixes 补列、worldchat 补 SQL、playerbots 补库)仍走"改吧/推吧",不在本工作流里偷偷改。
 
