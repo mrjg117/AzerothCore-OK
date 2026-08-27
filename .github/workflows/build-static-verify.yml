@@ -124,7 +124,7 @@ jobs:
 
   # =========================================================================
   # 门 2：deploy-test（部署门，needs: build → 编译干净才跑；fail-loud）
-  # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，挂 ac-maps 卷，注入真实配置）
+  # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，挂 ac-maps 卷，云端 .env 用占位 SOAP 验证栈能起）
   # 错误暴露（在官方流程之上，且「收全」不遇首错即退）：
   #   - db-import 跑完 grep 日志 Unhandled/errno/does not exist/Duplicate entry/truncated → 官方 dbimport 非 fail-fast，必须靠 grep 抓「带病 exit 0」
   #   - worldserver 等 "WORLD Initialized"，再 grep ABORT/Could not prepare/Table ... doesn't exist
@@ -174,31 +174,32 @@ jobs:
           done
           [ "$fail" = "0" ] || { echo "!! 缺失镜像，部署无法继续"; exit 1; }
 
-      - name: Write CI .env (real config values)
+      - name: Write CI .env (placeholder config — real SOAP/IP on user machine)
         run: |
           cd official
           cat > .env <<EOF
           IMAGE_NS=ghcr.io/${{ github.repository_owner }}
           DB_IMAGE=ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4
           REALM_ADDRESS=127.0.0.1
-          SOAP_LOGIN=${{ secrets.SOAP_LOGIN }}
-          SOAP_PASSWORD=${{ secrets.SOAP_PASSWORD }}
+          # 云端仅用占位值验证整栈能起；真实 SOAP/IP 在用户机 .env 提供（ac-extra-config 运行时读 ${SOAP_PASSWORD}）
+          SOAP_LOGIN=ci-test
+          SOAP_PASSWORD=ci-test
           EOF
           mkdir -p env/dist/etc
 
       - name: Bring up stack (official compose + OK override)
         run: |
           cd official
-          docker compose -f apps/docker/docker-compose.yml \
+          docker compose -f docker-compose.yml \
             -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" up -d
-          docker compose -f apps/docker/docker-compose.yml \
+          docker compose -f docker-compose.yml \
             -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" ps
 
       - name: Expose db-import errors (collect ALL, no early exit; 未退出也判 FAIL)
         if: always()
         run: |
           cd official
-          CF="apps/docker/docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          CF="docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
           DI_SEEN=0
           for i in $(seq 1 60); do
             st=$(docker compose -f $CF ps ac-db-import --status exited -q 2>/dev/null)
@@ -220,7 +221,7 @@ jobs:
         if: always()
         run: |
           cd official
-          CF="apps/docker/docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          CF="docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
           WS_INIT=0; WS_SEEN=0
           for i in $(seq 1 60); do
             if docker compose -f $CF ps ac-worldserver --status running -q >/dev/null 2>&1; then WS_SEEN=1; fi
@@ -256,7 +257,7 @@ jobs:
         if: success()
         run: |
           cd official
-          CF="apps/docker/docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          CF="docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
           echo "== graceful stop ac-database =="
           docker compose -f $CF stop ac-database
           for i in $(seq 1 30); do
@@ -283,7 +284,7 @@ jobs:
         if: always()
         run: |
           cd official
-          docker compose -f apps/docker/docker-compose.yml \
+          docker compose -f docker-compose.yml \
             -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" down -v || true
 
   # =========================================================================
