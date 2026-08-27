@@ -1,0 +1,57 @@
+# AzerothCore-OK —— 大包部署 compose（绑定挂载配置/地图，不依赖 ac-maps / ac-extra-config 镜像）
+#
+# 用法（下载两个包后）：
+#   1) docker load ac-bundle-latest.tar.zst   # 5 主镜像 + mysql + 配置(etc.tar.zst) + 冻库(ac-db-data.tar.zst)
+#   2) docker load ac-maps-latest.tar.zst      # 地图(data.tar.zst)
+#   3) 解压：
+#        ac-db-data.tar.zst → ./env/dist/mysql-data/   （挂进 mysql 卷，零重导）
+#        etc.tar.zst      → ./env/dist/etc/
+#        data.tar.zst     → ./env/dist/data/
+#   4) cp .env.example .env  并填真实 SOAP_LOGIN / SOAP_PASSWORD / REALM_ADDRESS / DB_ROOT_PASSWORD
+#   5) bash deploy/inject-config.sh            （用本机 .env 替换 ./env/dist/etc 里的 __SOAP_*__ 占位符）
+#   6) docker compose -f docker-compose.bundle.yml up -d
+#
+# 配置/地图均来自仓库与 wowgaming（别人仓库），不烤进镜像；与官方「etc/data 绑定挂载」机制一致。
+services:
+  ac-database:
+    image: ${DB_IMAGE:-ghcr.io/mrjg117/ac-wotlk-mysql:8.4}
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-AcokDbRoot2026!}
+    volumes:
+      - ./env/dist/mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${DB_ROOT_PASSWORD:-AcokDbRoot2026!}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  ac-db-import:
+    image: ${IMAGE_NS:-ghcr.io/mrjg117}/ac-wotlk-db-import:latest
+    depends_on:
+      ac-database:
+        condition: service_healthy
+    volumes:
+      - ./env/dist/etc:/azerothcore/env/dist/etc
+
+  ac-worldserver:
+    image: ${IMAGE_NS:-ghcr.io/mrjg117}/ac-wotlk-worldserver:latest
+    depends_on:
+      ac-database:
+        condition: service_healthy
+      ac-db-import:
+        condition: service_completed_successfully
+    environment:
+      - REALM_ADDRESS=${REALM_ADDRESS}
+    volumes:
+      - ./env/dist/etc:/azerothcore/env/dist/etc
+      - ./env/dist/data:/azerothcore/env/dist/data:ro
+
+  ac-authserver:
+    image: ${IMAGE_NS:-ghcr.io/mrjg117}/ac-wotlk-authserver:latest
+    depends_on:
+      ac-database:
+        condition: service_healthy
+      ac-db-import:
+        condition: service_completed_successfully
+    volumes:
+      - ./env/dist/etc:/azerothcore/env/dist/etc

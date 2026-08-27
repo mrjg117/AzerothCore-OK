@@ -10,9 +10,16 @@ name: build-static-verify
 #   = 即「编译出错编译完成前停查一遍错 → 再测部署 → 部署出错再查部署 → 都干净才完成打包」；每道门内收全错误。
 # 「参照以前」= build 步与 package 步原样复用 build-core.yml 的 clone/40模块/Apply build-patches/CMODULES=static/push/bundle+upload。
 # 「一切用官方流程」= 不替换官方 Dockerfile/compose/db-import；仅在官方流程之上叠错误暴露（grep 日志），官方流程完整还原。
-# 「大包 + 地图单独包」= 用户要求：五个主镜像 + 配置(ac-extra-config) + 冻好的数据库 并进 ac-bundle-latest.tar.zst；
-#   地图(ac-maps, ~3.24GB)单独成 ac-maps-latest.tar.zst 传外置储存（便于单独更新/下载，不进大包）。
-#   用户机下载两包 → docker load 两个 → 解压数据库进卷 → compose up = 满状态，不重导。
+#
+# 配置 / 地图不打包成镜像（用户纠正）：
+#   - 配置：就在仓库 config/extra-config/confs/，CI 直接把占位符填占位值 ci-test（测试只验部署链路，不较真配置）
+#     后绑定挂载进 ./env/dist/etc（与官方 etc 绑定挂载机制一致），不构建 ac-extra-config 镜像。
+#   - 地图：直接从「别人仓库」github.com/wowgaming/client-data 的 Release Data.zip 下载解压进 ./env/dist/data 绑定挂载，
+#     不构建 ac-maps 镜像。
+#   - 打包：5 主镜像(worldserver/authserver/db-import/tools/mysql) + etc.tar.zst(配置模板) + ac-db-data.tar.zst(冻库)
+#     并进 ac-bundle-latest.tar.zst；地图 data.tar.zst 单独成 ac-maps-latest.tar.zst（便于单独更新/下载，不进大包）。
+#   - 用户机：docker load 两包 → 解压数据库进卷、解压 etc/data 到 ./env/dist/{etc,data} →
+#     deploy/inject-config.sh 用本机 .env 替换 SOAP 占位符 → docker compose -f docker-compose.bundle.yml up -d = 满状态。
 
 on:
   workflow_dispatch:
@@ -29,6 +36,7 @@ permissions:
 
 env:
   ACORE_REF: Playerbot
+  CLIENT_DATA_REF: v20.0
 
 jobs:
   # =========================================================================
@@ -36,6 +44,7 @@ jobs:
   # 复用 build-core.yml：clone Playerbot fork + 40 模块 + Apply build-patches + docker buildx CMODULES=static + push ghcr
   # 任何编译报错 = 本 job 失败（最终必须整体无错）；官方编译遇错即非零退出（分段查错模型）。
   # 失败 → 停在编译门（needs 链阻断 deploy-test / package，无镜像可测）。
+  # 只编 5 主镜像（worldserver/authserver/db-import/tools/mysql），不编 ac-maps / ac-extra-config（那俩不是镜像，见头部说明）。
   # =========================================================================
   build:
     runs-on: ubuntu-latest
@@ -123,57 +132,12 @@ jobs:
           docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4"
           docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:latest"
 
-      - name: Build & push ac-maps (ghcr.io, 社区预提取地图; 名称无 ac-wotlk- 前缀，与 override / build-maps.yml 一致)
-        # 真实镜像名 = ac-maps（不是 ac-wotlk-ac-maps），否则 deploy-test 拉取 manifest unknown
-        run: |
-          set -e
-          cd "${{ github.workspace }}/acore-build-repo"
-          CLIENT_DATA_REF=v20.0
-          echo "Downloading https://github.com/wowgaming/client-data/releases/download/$CLIENT_DATA_REF/Data.zip"
-          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/$CLIENT_DATA_REF/Data.zip"
-          mkdir -p config/maps/data
-          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
-          unzip -q /tmp/data.zip -d /tmp/extracted
-          if [ -d /tmp/extracted/Data ]; then
-            mv /tmp/extracted/Data/* config/maps/data/
-          else
-            mv /tmp/extracted/* config/maps/data/
-          fi
-          VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
-          TAGS="ghcr.io/${{ github.repository_owner }}/ac-maps:$VERSION,ghcr.io/${{ github.repository_owner }}/ac-maps:latest"
-          BUILDX_TAGS=""
-          IFS=',' read -ra _arr <<< "$TAGS"
-          for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
-          docker buildx build $BUILDX_TAGS --push config/maps
-          rm -rf config/maps/data /tmp/data.zip /tmp/extracted
-
-      - name: Build & push ac-extra-config (ghcr.io, 名称无 ac-wotlk- 前缀)
-        run: |
-          set -e
-          cd "${{ github.workspace }}/acore-build-repo"
-          VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
-          TAGS="ghcr.io/${{ github.repository_owner }}/ac-extra-config:$VERSION,ghcr.io/${{ github.repository_owner }}/ac-extra-config:latest"
-          BUILDX_TAGS=""
-          IFS=',' read -ra _arr <<< "$TAGS"
-          for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
-          docker buildx build $BUILDX_TAGS --push config/extra-config
-
-      - name: Set ac-maps / ac-extra-config package visibility public
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          for p in ac-maps ac-extra-config; do
-            curl -sS -X PATCH \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/user/packages/container/${{ github.repository_owner }}%2F$p/visibility" \
-              -d '{"visibility":"public"}'
-          done
-
   # =========================================================================
   # 门 2：deploy-test（部署门，needs: build → 编译干净才跑；fail-loud）
-  # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，挂 ac-maps 卷，云端 .env 用占位 SOAP 验证栈能起）
+  # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，绑挂载地图/配置，云端用占位值验证栈能起）
+  # 不构建/不拉 ac-maps、ac-extra-config 镜像：
+  #   - 配置 = 仓库 config/extra-config/confs 扁平化 + sed 填占位值 ci-test → 绑定挂载 ./env/dist/etc
+  #   - 地图 = 直接从 wowgaming/client-data 下载 Data.zip 解压 → 绑定挂载 ./env/dist/data
   # 错误暴露（在官方流程之上，且「收全」不遇首错即退）：
   #   - db-import 跑完 grep 日志 Unhandled/errno/does not exist/Duplicate entry/truncated → 官方 dbimport 非 fail-fast，必须靠 grep 抓「带病 exit 0」
   #   - worldserver 等 "WORLD Initialized"，再 grep ABORT/Could not prepare/Table ... doesn't exist
@@ -185,7 +149,7 @@ jobs:
   deploy-test:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -209,12 +173,12 @@ jobs:
           git fetch --depth 1 origin "$ACORE_REF"
           git checkout "$ACORE_REF"
 
-      - name: Pull built images + ac-maps + ac-extra-config (缺任一即失败，不吞错)
+      - name: Pull built 5 images (缺任一即失败，不吞错)
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
           fail=0
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-mysql ac-maps ac-extra-config; do
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do
             if docker pull "$NS/$t:latest"; then
               echo "pulled $t"
             else
@@ -223,32 +187,86 @@ jobs:
           done
           [ "$fail" = "0" ] || { echo "!! 缺失镜像，部署无法继续"; exit 1; }
 
-      - name: Write CI .env (placeholder config — real SOAP/IP on user machine)
+      - name: Prepare config (repo confs → ./env/dist/etc, 占位符随便填占位值)
+        run: |
+          set -e
+          OFF="${{ github.workspace }}/official"
+          ETC="$OFF/env/dist/etc"
+          mkdir -p "$ETC"
+          # 扁平化：仓库按模组分子目录，AC 的 etc 是扁平目录，拍平成 basename
+          for f in $(find "${{ github.workspace }}/acore-build-repo/config/extra-config/confs" -type f -name '*.conf'); do
+            cp "$f" "$ETC/$(basename "$f")"
+          done
+          # 测试只验证「部署链路能否跑通」：核心/模组配置不影响 worldserver 启动就随便填；
+          # 占位符直接 sed 填占位值 ci-test（SOAP 启用与否不碍初始化，不较真）
+          sed -i 's/__SOAP_LOGIN__/ci-test/g; s/__SOAP_PASSWORD__/ci-test/g' "$ETC"/*.conf
+          echo "== prepared etc =="; ls -1 "$ETC"
+
+      - name: Prepare maps (直接从 wowgaming/client-data 下载 Data.zip 解压 → ./env/dist/data 绑定挂载)
+        run: |
+          set -e
+          OFF="${{ github.workspace }}/official"
+          DATA="$OFF/env/dist/data"
+          mkdir -p "$DATA"
+          echo "Downloading https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
+          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
+          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
+          unzip -q /tmp/data.zip -d /tmp/extracted
+          if [ -d /tmp/extracted/Data ]; then
+            mv /tmp/extracted/Data/* "$DATA"/
+          else
+            mv /tmp/extracted/* "$DATA"/
+          fi
+          rm -rf /tmp/data.zip /tmp/extracted
+          echo "== prepared data =="; du -sh "$DATA"; ls "$DATA" | head
+
+      - name: Write CI .env (占位配置 —— 真实 SOAP/IP 在用户机 .env)
         run: |
           cd official
           cat > .env <<EOF
           IMAGE_NS=ghcr.io/${{ github.repository_owner }}
           DB_IMAGE=ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4
+          MYSQL_ROOT_PASSWORD=ci-test
           REALM_ADDRESS=127.0.0.1
-          # 云端仅用占位值验证整栈能起；真实 SOAP/IP 在用户机 .env 提供（ac-extra-config 运行时读 ${SOAP_PASSWORD}）
+          # 云端测试用占位值验证整栈能起（核心/模组配置不影响部署就随便填）
           SOAP_LOGIN=ci-test
           SOAP_PASSWORD=ci-test
           EOF
-          mkdir -p env/dist/etc
+          echo "== .env written =="; cat .env
 
-      - name: Bring up stack (official compose + OK override)
+      - name: Write CI test override (绑定挂载 etc/data，禁用 ac-extra-config / ac-client-data-init 镜像)
         run: |
           cd official
-          docker compose -f docker-compose.yml \
-            -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" up -d
-          docker compose -f docker-compose.yml \
-            -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" ps
+          # 官方 worldserver 依赖 ac-client-data-init（其负责填命名卷 ac-client-data）；
+          # 此处改为绑定挂载 ./env/dist/data 并去掉该依赖，禁用两个镜像服务（它们本就不该是镜像）。
+          cat > ci-test-override.yml <<EOF
+          services:
+            ac-worldserver:
+              depends_on:
+                ac-database:
+                  condition: service_healthy
+                ac-db-import:
+                  condition: service_completed_successfully
+              volumes:
+                - ${{ github.workspace }}/official/env/dist/data:/azerothcore/env/dist/data:ro
+            ac-extra-config:
+              profiles: ["_disabled"]
+            ac-client-data-init:
+              profiles: ["_disabled"]
+          EOF
+          echo "== ci-test-override.yml =="; cat ci-test-override.yml
+
+      - name: Bring up stack (official compose + CI test override)
+        run: |
+          cd official
+          docker compose -f docker-compose.yml -f ci-test-override.yml up -d
+          docker compose -f docker-compose.yml -f ci-test-override.yml ps
 
       - name: Expose db-import errors (collect ALL, no early exit; 未退出也判 FAIL)
         if: always()
         run: |
           cd official
-          CF="docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          CF="docker-compose.yml -f ci-test-override.yml"
           DI_SEEN=0
           for i in $(seq 1 60); do
             st=$(docker compose -f $CF ps ac-db-import --status exited -q 2>/dev/null)
@@ -270,7 +288,7 @@ jobs:
         if: always()
         run: |
           cd official
-          CF="docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          CF="docker-compose.yml -f ci-test-override.yml"
           WS_INIT=0; WS_SEEN=0
           for i in $(seq 1 60); do
             if docker compose -f $CF ps ac-worldserver --status running -q >/dev/null 2>&1; then WS_SEEN=1; fi
@@ -306,7 +324,7 @@ jobs:
         if: success()
         run: |
           cd official
-          CF="docker-compose.yml -f ${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml"
+          CF="docker-compose.yml -f ci-test-override.yml"
           echo "== graceful stop ac-database =="
           docker compose -f $CF stop ac-database
           for i in $(seq 1 30); do
@@ -333,17 +351,17 @@ jobs:
         if: always()
         run: |
           cd official
-          docker compose -f docker-compose.yml \
-            -f "${{ github.workspace }}/acore-build-repo/deploy/docker-compose.override.yml" down -v || true
+          docker compose -f docker-compose.yml -f ci-test-override.yml down -v || true
 
   # =========================================================================
   # package（needs: [build, deploy-test] → 两门都干净才跑；原样复用 build-core.yml 的 bundle/upload 步，
-  #   并把地图(ac-maps) + 配置(ac-extra-config) + 冻好的数据库(ac-db-data.tar.zst) 一并并进同一个大包）
+  #   并把 配置(etc.tar.zst) + 冻好的数据库(ac-db-data.tar.zst) 一并并进同一个大包；地图(data.tar.zst)单独成包）
+  # 配置/地图不再作为镜像：配置从仓库 confs 扁平化 tarball，地图从 wowgaming 下载解压 tarball。
   # =========================================================================
   package:
     needs: [build, deploy-test]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - name: GATE — 确认两门干净才打包
         run: |
@@ -368,15 +386,44 @@ jobs:
           name: ac-db-data
           path: ${{ github.workspace }}
 
-      - name: Pull 7 images (5 主镜像 + ac-extra-config 进大包；ac-maps 单独打包不进大包，此处仍 pull 以便单独 save)
+      - name: Pull 5 images (进大包)
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-maps ac-extra-config; do
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do
             docker pull "$NS/$t:latest"
           done
 
-      - name: Save all images + frozen DB into one big bundle
+      - name: Build config tarball (仓库 confs 扁平化 + 占位符保留供用户机替换)
+        run: |
+          set -e
+          mkdir -p /tmp/bundle/etc
+          for f in $(find "${{ github.workspace }}/acore-build-repo/config/extra-config/confs" -type f -name '*.conf'); do
+            cp "$f" "/tmp/bundle/etc/$(basename "$f")"
+          done
+          # 保留 __SOAP_*__ 占位符（不替换），用户机 deploy/inject-config.sh 用本机 .env 替换
+          tar -cf /tmp/bundle/etc.tar.zst -I zstd -C /tmp/bundle/etc .
+          ls -lh /tmp/bundle/etc.tar.zst
+
+      - name: Build maps tarball (地图单独包：直接从 wowgaming/client-data 下载解压)
+        run: |
+          set -e
+          mkdir -p /tmp/maps
+          echo "Downloading https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
+          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
+          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
+          unzip -q /tmp/data.zip -d /tmp/extracted
+          if [ -d /tmp/extracted/Data ]; then
+            mv /tmp/extracted/Data/* /tmp/maps/
+          else
+            mv /tmp/extracted/* /tmp/maps/
+          fi
+          rm -rf /tmp/data.zip /tmp/extracted
+          tar -cf ac-maps-latest.tar.zst -I zstd -C /tmp/maps .
+          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
+          ls -lh ac-maps-latest.tar.zst
+
+      - name: Save all images + config + frozen DB into one big bundle
         env:
           ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
           ONEDRIVE_TENANT: ${{ secrets.ONEDRIVE_TENANT }}
@@ -393,19 +440,15 @@ jobs:
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
-          IMAGES="ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-extra-config"
+          IMAGES="ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql"
           mkdir -p /tmp/bundle
           docker save $(for t in $IMAGES; do echo "$NS/$t:latest"; done) -o /tmp/bundle/images.tar
           cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
+          cp /tmp/bundle/etc.tar.zst /tmp/bundle/
           ls -lh /tmp/bundle/
           tar -cf ac-bundle-latest.tar.zst -I zstd -C /tmp/bundle .
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
           ls -lh ac-bundle-latest.tar.zst
-          # 地图单独打包（不进大包，便于单独更新/下载；真实名 ac-maps，无 ac-wotlk- 前缀）
-          docker save "$NS/ac-maps:latest" -o /tmp/ac-maps.tar
-          zstd -c /tmp/ac-maps.tar -o ac-maps-latest.tar.zst
-          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
-          ls -lh ac-maps-latest.tar.zst
           if [ -n "$S3_BUCKET" ]; then
             curl -sSfL https://rclone.org/install.sh | sudo bash
             command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
@@ -416,12 +459,12 @@ jobs:
           bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
           bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
 
-      - name: Set package visibility public
+      - name: Set package visibility public (仅 5 主镜像)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-maps ac-extra-config; do
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do
             curl -sS -X PATCH \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -456,4 +499,4 @@ jobs:
               if gh api -X DELETE "$base/$e/versions/$vid" >/dev/null 2>&1; then echo "  deleted $vid"; else echo "  FAILED $vid"; fi
             done
           }
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-maps ac-extra-config; do prune "$owner/$t"; done
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do prune "$owner/$t"; done

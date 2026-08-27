@@ -18,8 +18,8 @@
 ## 2. 参照以前（复用 build-core.yml，不另起炉灶）
 build 与 package 两阶段直接搬 `build-core.yml` 的真实步：
 - **编译**：`clone Playerbot fork @Playerbot` → 按 `config/modules.txt` 拉 40 模块（去 `-master` 后缀）→ `Apply build-patches`（沿用现有约定：`*.patch` 走 `git apply`，失败回退 `patch -p1`；`*.sh` 在目标目录执行；`overlay/` 整目录覆盖）→ `docker buildx ... --target <t> -f apps/docker/Dockerfile --build-arg CMODULES=static --push`（worldserver/authserver/db-import/tools 四 target）→ 拉 `mysql:8.4` 打 tag 推 `ac-wotlk-mysql`。
-- **打包**：`docker save` 七个镜像 → 与 `ac-db-data.tar.zst`(冻好的数据库) 一并 `tar -I zstd` 成 `ac-bundle-latest.tar.zst`(+`.sha256`) → `.github/scripts/upload_artifacts.sh` 传外置储存（OneDrive 证书 / S3 凭证，有哪个传哪个）→ 设 ghcr 公开 → prune 保留最新 12 版。
-- **大包 + 地图单独包（用户要求）**：`ac-bundle-latest.tar.zst` = 五个主镜像(worldserver/authserver/db-import/tools/mysql) + 配置(ac-extra-config) + 冻好的数据库(`ac-db-data.tar.zst`)；地图 `ac-maps`(~3.24GB) 单独成 `ac-maps-latest.tar.zst` 传外置储存，**不进大包**（便于单独更新/下载）。用户机下载两个包 → `docker load` 两个 → 解压数据库进卷 + `compose up` = 满状态，不重导数据。
+- **打包**：`docker save` 五个主镜像(worldserver/authserver/db-import/tools/mysql) → 与 `ac-db-data.tar.zst`(冻好的数据库) 一并 `tar -I zstd` 成 `ac-bundle-latest.tar.zst`(+`.sha256`) → `.github/scripts/upload_artifacts.sh` 传外置储存（OneDrive 证书 / S3 凭证，有哪个传哪个）→ 设 ghcr 公开 → prune 保留最新 12 版。
+- **大包 + 地图单独包（用户要求，配置/地图不做镜像）**：`ac-bundle-latest.tar.zst` = 五个主镜像(worldserver/authserver/db-import/tools/mysql) 的 `docker save` tar + `etc.tar.zst`(配置模板，保留 __SOAP_*__ 占位符) + `ac-db-data.tar.zst`(冻库)；地图 `data.tar.zst`(~3.24GB，来自 wowgaming/client-data) 单独成 `ac-maps-latest.tar.zst` 传外置储存，**不进大包**（便于单独更新/下载）。用户机下载两包 → `docker load` 两个 → 解压数据库进卷 + 解压 etc/data 到 `./env/dist/{etc,data}` → `deploy/inject-config.sh` 用本机 `.env` 替换 SOAP 占位符 → `compose -f docker-compose.bundle.yml up -d` = 满状态，不重导。
 
 ## 3. 一切用官方流程（尽量完整还原，不偷改）
 - **静态是官方默认**：`config.cmake` 里 `set(MODULES "static")` 即官方默认；官方 Dockerfile `ARG CMODULES="static"`。动态需补 `COPY --from=build .../*.so`，反而要改官方 Dockerfile → 选静态。
@@ -40,16 +40,17 @@ R1–R5（已在 192.168.10.99 服务端**手工**修复，但**未固化进仓�
 ## 4.5 冻库（方案B）与用户机部署（本次新增）
 - **冻库方式 = 方案B（冷拷数据目录）**：部署门干净后，`docker compose stop ac-database` 优雅停库 → `docker cp` 拷出 `/var/lib/mysql` 整个目录 → `tar -I zstd` 压成 `ac-db-data.tar.zst` → 作为 artifact 传给 package 并进大包。
 - **为什么选 B 而非 A**：大包已含 `ac-wotlk-mysql:8.4` 镜像，用户机 MySQL 版本与云上完全一致，B 的「版本绑定」副作用被消除；用户机 load 后直接挂上即可，**零重导**（A 还需多一条还原命令）。若日后用户换 MySQL 大版本，再退回 A（mysqldump）兜底。
-- **大包内容**：`ac-bundle-latest.tar.zst` = 6 个镜像(worldserver/authserver/db-import/tools/mysql/ac-extra-config) 的 `docker save` tar + `ac-db-data.tar.zst`；地图单独：`ac-maps-latest.tar.zst` = `ac-maps:latest` 的 `docker save`（真实镜像名无 `ac-wotlk-` 前缀）。
-- **用户机部署步骤（极简）**：① `docker load` 两个包（大包 images.tar + 地图包）；② 把 `ac-db-data.tar.zst` 解压进 mysql 数据卷（**解压≠重导**，秒级，直接挂上即用）；③ `compose up`。db-import 在用户机仍会随 `up` 跑（官方流程），但库已完整，它幂等重放、基本空转（靠 `updates` 日志 + `IF NOT EXISTS` 跳过已应用项）；若不想让它跑，用户可去掉 compose 里的 `ac-db-import` 服务——**注意同时删 worldserver/authserver 里 `depends_on: ac-db-import`，否则 compose 报悬空依赖**。
+- **大包内容**：`ac-bundle-latest.tar.zst` = 5 个镜像(worldserver/authserver/db-import/tools/mysql) 的 `docker save` tar + `etc.tar.zst`(配置模板) + `ac-db-data.tar.zst`(冻库)；地图单独：`ac-maps-latest.tar.zst` = `data.tar.zst`（wowgaming/client-data 的 Data.zip 解压，**不是镜像**）。
+- **用户机部署步骤（极简，无 ac-maps / ac-extra-config 镜像）**：① `docker load` 两个包；② 解压 `ac-db-data.tar.zst` → `./env/dist/mysql-data`（挂 mysql 卷，零重导）、`etc.tar.zst` → `./env/dist/etc`、`data.tar.zst` → `./env/dist/data`；③ `cp .env.example .env` 填真实 SOAP/IP/DB 密码；④ `bash deploy/inject-config.sh` 替换 `./env/dist/etc` 占位符；⑤ `docker compose -f docker-compose.bundle.yml up -d` = 满状态。db-import 仍随 `up` 跑（官方流程），库已完整→幂等空转；想跳过就删 `ac-db-import` 服务并同步删 worldserver/authserver 的 `depends_on: ac-db-import`。
 - **偏离官方之处（用户明确要求）**：官方每次 `compose up` 都重跑 db-import 导数据；本流程改为「云上导一次、冻进包、用户机免导」。官方流程仍用于云上「构建+测试+验证」阶段（db-import 照跑、照抓错），只改了「交付物」形态。
-- **体积预警**：大包(5主镜像+ac-extra-config+冻库)可能 ~4–6GB；地图单独包 ac-maps ~3.24GB。两者分开传/下，地图可单独更新，属预期。
+- **体积预警**：大包(5主镜像+etc.tar.zst+冻库)可能 ~4–6GB；地图单独包 ac-maps ~3.24GB。两者分开传/下，地图可单独更新，属预期。
 
 ## 5. 首跑前置（必看，否则部署门直接挂）
-- `ac-maps` / `ac-extra-config` **由本工作流在 build 门内自建并推送**（自包含，不依赖预先跑 `build-maps.yml` / `build-config`）：`ac-maps` = 下载 `wowgaming/client-data@v20.0` 的 `Data.zip` 烤入（`CLIENT_DATA_REF` 在 build 步固定）；`ac-extra-config` = 构建 `config/extra-config`（其 `docker-entrypoint.sh` 运行时读 `${SOAP_PASSWORD}` 注入 `worldserver.conf`）。两者进 ghcr 后 deploy-test 拉取、package 并入包，用户机无需另拉。
-- **云端测试不配真实 SOAP**：工作流 `.env` 用占位值 `ci-test`；真实 `SOAP_LOGIN/PASSWORD` 与 `REALM_ADDRESS` 在**用户机 `.env`** 提供（`ac-extra-config` 运行时读 `${SOAP_PASSWORD}` 注入 `worldserver.conf`）。CI 无需配 SOAP secrets。
-- runner 磁盘：部署吃 18–21GB，建议加 `free_disk.sh` 腾空间；内存 worldserver ~8GiB + MySQL ~1GiB。
-- 部署门对"镜像缺失 / 容器未起来"也判 FAIL（拉镜像失败即 exit 1；db-import 未在超时内 exited、worldserver 未初始化且未捕获崩溃也判 FAIL），避免假阴性漏报。
+- **配置/地图不再构建镜像**：`ac-extra-config` / `ac-maps` 镜像已废弃。配置 = 仓库 `config/extra-config/confs/` 扁平化 + sed 填占位值 ci-test 后绑定挂载 `./env/dist/etc`；地图 = 直接从 `wowgaming/client-data@${{ env.CLIENT_DATA_REF }}` 下载 `Data.zip` 解压绑定挂载 `./env/dist/data`（见头部说明）。deploy-test 与 package 均不再 pull/push 这两个镜像。
+- **云端测试不较真配置**：deploy-test 直接 `sed` 把 `__SOAP_*__` 占位符填占位值 `ci-test`（测试只验部署链路能否跑通，核心/模组配置不影响 worldserver 启动就随便填）；真实 `SOAP_LOGIN/PASSWORD` 与 `REALM_ADDRESS` 仍在**用户机 `.env`** 提供，经 `deploy/inject-config.sh` 替换进 `./env/dist/etc`。CI 无需配 SOAP secrets。
+- runner 磁盘：部署吃 18–21GB（含下载 ~3.24GB Data.zip），建议加 `free_disk.sh` 腾空间；内存 worldserver ~8GiB + MySQL ~1GiB。
+- 部署门对"镜像缺失 / 容器未起来"也判 FAIL（拉 5 主镜像失败即 exit 1；db-import 未在超时内 exited、worldserver 未初始化且未捕获崩溃也判 FAIL），避免假阴性漏报。
+- 用户机部署改用 `deploy/docker-compose.bundle.yml`（绑定挂载 etc/data，5 主镜像），不要再用 `deploy/docker-compose.override.yml`（它引用已废弃的 ac-maps/ac-extra-config 镜像）。
 
 ## 6. 不要做的事（铁律）
 - 不要改 `build-core.yml`（新建独立工作流）。
@@ -59,4 +60,4 @@ R1–R5（已在 192.168.10.99 服务端**手工**修复，但**未固化进仓�
 
 ## 7. 触发与产物
 - `workflow_dispatch` 手动触发（默认）；schedule 段留了每日/每周/每月模板，按需解注释。
-- 产物：`ac-bundle-latest.tar.zst`（大包）+ `ac-maps-latest.tar.zst`（地图）均传外置储存，ghcr 七个包（5 主镜像 + ac-maps + ac-extra-config）设公开，保留最新 12 版。
+- 产物：`ac-bundle-latest.tar.zst`（大包：5 主镜像 + etc.tar.zst + 冻库）+ `ac-maps-latest.tar.zst`（地图 data.tar.zst）均传外置储存，ghcr 仅 5 主镜像设公开（配置/地图是文件 tarball 不进 ghcr），保留最新 12 版。
