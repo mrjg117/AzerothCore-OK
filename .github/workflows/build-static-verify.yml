@@ -117,9 +117,9 @@ jobs:
         run: |
           set -e
           cd "${{ github.workspace }}/official"
-          # 官方 CMODULES 默认 static（Dockerfile ARG），不覆盖。core build-patch(keep_going.sh) 已给 cmake --build 加 -- -k，遇错继续编译、暴露全部模组错误。
+          # 官方 CMODULES 默认 static（Dockerfile ARG），不覆盖。core build-patch(keep_going.sh) 已给 cmake --build 加 -- -k 0（官方用 Ninja 生成器，-k 必须带数字 0=无限继续），遇错继续编译、暴露全部模组错误。
           # --profile tools 放 docker compose 全局位（compose v2 的 --profile 是全局 flag，不能放 build 子命令后），一并编 tools 进大包。
-          # 注：官方 cmake --build 本不带 -k（单服务内编译错只报第一个）；经 core build-patch 已加 -- -k 透传 make，现可暴露全部模组编译错误；有错 make 返回非0 -> step 非零退 -> 后续 if:success 不跑 -> 不打包。
+          # 注：官方 cmake --build 本不带 -k（单服务内编译错只报第一个）；经 core build-patch 已加 -- -k 0 透传 ninja，现可暴露全部模组编译错误；有错 ninja 返回非0 -> step 非零退 -> 后续 if:success 不跑 -> 不打包。
           docker compose --profile tools build
           echo "== build done =="
 
