@@ -10,8 +10,9 @@ name: build-static-verify
 #   = 即「编译出错编译完成前停查一遍错 → 再测部署 → 部署出错再查部署 → 都干净才完成打包」；每道门内收全错误。
 # 「参照以前」= build 步与 package 步原样复用 build-core.yml 的 clone/40模块/Apply build-patches/CMODULES=static/push/bundle+upload。
 # 「一切用官方流程」= 不替换官方 Dockerfile/compose/db-import；仅在官方流程之上叠错误暴露（grep 日志），官方流程完整还原。
-# 「一个大包」= 用户要求：五个主镜像 + 地图(ac-maps) + 配置(ac-extra-config) + 冻好的数据库，全并进 ac-bundle-latest.tar.zst，
-#   用户机下载 → docker load → 解压数据库进卷 → compose up = 满状态，不另拉、不重导。
+# 「大包 + 地图单独包」= 用户要求：五个主镜像 + 配置(ac-extra-config) + 冻好的数据库 并进 ac-bundle-latest.tar.zst；
+#   地图(ac-maps, ~3.24GB)单独成 ac-maps-latest.tar.zst 传外置储存（便于单独更新/下载，不进大包）。
+#   用户机下载两包 → docker load 两个 → 解压数据库进卷 → compose up = 满状态，不重导。
 
 on:
   workflow_dispatch:
@@ -319,7 +320,7 @@ jobs:
           name: ac-db-data
           path: ${{ github.workspace }}
 
-      - name: Pull all 7 images (5 主镜像 + ac-maps + ac-extra-config)
+      - name: Pull 6 images + ac-maps (5 主镜像 + ac-extra-config 进大包；ac-maps 单独打包不进大包，此处仍 pull 以便单独 save)
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
@@ -344,7 +345,7 @@ jobs:
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
-          IMAGES="worldserver authserver db-import tools mysql ac-maps ac-extra-config"
+          IMAGES="worldserver authserver db-import tools mysql ac-extra-config"
           mkdir -p /tmp/bundle
           docker save $(for t in $IMAGES; do echo "$NS/ac-wotlk-$t:latest"; done) -o /tmp/bundle/images.tar
           cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
@@ -352,6 +353,11 @@ jobs:
           tar -cf ac-bundle-latest.tar.zst -I zstd -C /tmp/bundle .
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
           ls -lh ac-bundle-latest.tar.zst
+          # 地图单独打包（不进大包，便于单独更新/下载）
+          docker save "$NS/ac-wotlk-ac-maps:latest" -o /tmp/ac-maps.tar
+          zstd -c /tmp/ac-maps.tar -o ac-maps-latest.tar.zst
+          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
+          ls -lh ac-maps-latest.tar.zst
           if [ -n "$S3_BUCKET" ]; then
             curl -sSfL https://rclone.org/install.sh | sudo bash
             command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
@@ -359,6 +365,8 @@ jobs:
           pip install --quiet msal 2>/dev/null || true
           bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
           bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
+          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
+          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
 
       - name: Set package visibility public
         if: always()
