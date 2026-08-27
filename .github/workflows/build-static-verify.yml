@@ -14,8 +14,8 @@ name: build-static-verify
 # 配置 / 地图不打包成镜像（用户纠正）：
 #   - 配置：就在仓库 config/extra-config/confs/，CI 直接把占位符填占位值 ci-test（测试只验部署链路，不较真配置）
 #     后绑定挂载进 ./env/dist/etc（与官方 etc 绑定挂载机制一致），不构建 ac-extra-config 镜像。
-#   - 地图：直接从「别人仓库」github.com/wowgaming/client-data 的 Release Data.zip 下载解压进 ./env/dist/data 绑定挂载，
-#     不构建 ac-maps 镜像。
+#   - 地图：保留官方 ac-client-data-init 服务（按官方 build: client-data target 从 wowgaming/client-data 拉 Data.zip 填命名卷 ac-client-data），
+#     不 pull 外部镜像、不建自定义镜像（该服务本就走官方 build 流程）。
 #   - 打包：5 主镜像(worldserver/authserver/db-import/tools/mysql) + etc.tar.zst(配置模板) + ac-db-data.tar.zst(冻库)
 #     并进 ac-bundle-latest.tar.zst；地图 data.tar.zst 单独成 ac-maps-latest.tar.zst（便于单独更新/下载，不进大包）。
 #   - 用户机：docker load 两包 → 解压数据库进卷、解压 etc/data 到 ./env/dist/{etc,data} →
@@ -135,9 +135,9 @@ jobs:
   # =========================================================================
   # 门 2：deploy-test（部署门，needs: build → 编译干净才跑；fail-loud）
   # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，绑挂载地图/配置，云端用占位值验证栈能起）
-  # 不构建/不拉 ac-maps、ac-extra-config 镜像：
-  #   - 配置 = 仓库 config/extra-config/confs 扁平化 + sed 填占位值 ci-test → 绑定挂载 ./env/dist/etc
-  #   - 地图 = 直接从 wowgaming/client-data 下载 Data.zip 解压 → 绑定挂载 ./env/dist/data
+  # 不构建/不拉 ac-maps、ac-extra-config 镜像（注：官方 compose 本就无 ac-extra-config 服务，配置走 ./env/dist/etc 绑定挂载）：
+  #   - 配置 = 仓库 config/extra-config/confs 模组段扁平化 + sed 填占位值 ci-test → 绑定挂载 ./env/dist/etc
+  #   - 地图 = 保留官方 ac-client-data-init 服务（按官方 build client-data target 从 wowgaming/client-data 拉 Data.zip 填命名卷 ac-client-data，不 override 其 build）
   # 错误暴露（在官方流程之上，且「收全」不遇首错即退）：
   #   - db-import 跑完 grep 日志 Unhandled/errno/does not exist/Duplicate entry/truncated → 官方 dbimport 非 fail-fast，必须靠 grep 抓「带病 exit 0」
   #   - worldserver 等 "WORLD Initialized"，再 grep ABORT/Could not prepare/Table ... doesn't exist
@@ -187,79 +187,60 @@ jobs:
           done
           [ "$fail" = "0" ] || { echo "!! 缺失镜像，部署无法继续"; exit 1; }
 
-      - name: Prepare config (repo confs → ./env/dist/etc, 占位符随便填占位值)
+      - name: Prepare config (仓库模组 conf 叠加 → ./env/dist/etc；核心 conf 用官方默认)
         run: |
           set -e
           OFF="${{ github.workspace }}/official"
           ETC="$OFF/env/dist/etc"
           mkdir -p "$ETC"
-          # 扁平化：仓库按模组分子目录，AC 的 etc 是扁平目录，拍平成 basename
+          # 仅叠加模组 conf；核心 worldserver.conf/authserver.conf 用官方镜像默认（entrypoint 自动复制），不覆盖以免破坏 DB 连接等默认设置
           for f in $(find "${{ github.workspace }}/acore-build-repo/config/extra-config/confs" -type f -name '*.conf'); do
-            cp "$f" "$ETC/$(basename "$f")"
+            b=$(basename "$f")
+            case "$b" in worldserver.conf|authserver.conf) continue;; esac
+            cp "$f" "$ETC/$b"
           done
-          # 测试只验证「部署链路能否跑通」：核心/模组配置不影响 worldserver 启动就随便填；
-          # 占位符直接 sed 填占位值 ci-test（SOAP 启用与否不碍初始化，不较真）
-          sed -i 's/__SOAP_LOGIN__/ci-test/g; s/__SOAP_PASSWORD__/ci-test/g' "$ETC"/*.conf
+          sed -i 's/__SOAP_LOGIN__/ci-test/g; s/__SOAP_PASSWORD__/ci-test/g' "$ETC"/*.conf 2>/dev/null || true
           echo "== prepared etc =="; ls -1 "$ETC"
 
-      - name: Prepare maps (直接从 wowgaming/client-data 下载 Data.zip 解压 → ./env/dist/data 绑定挂载)
-        run: |
-          set -e
-          OFF="${{ github.workspace }}/official"
-          DATA="$OFF/env/dist/data"
-          mkdir -p "$DATA"
-          echo "Downloading https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
-          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
-          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
-          unzip -q /tmp/data.zip -d /tmp/extracted
-          if [ -d /tmp/extracted/Data ]; then
-            mv /tmp/extracted/Data/* "$DATA"/
-          else
-            mv /tmp/extracted/* "$DATA"/
-          fi
-          rm -rf /tmp/data.zip /tmp/extracted
-          echo "== prepared data =="; du -sh "$DATA"; ls "$DATA" | head
-
-      - name: Write CI .env (占位配置 —— 真实 SOAP/IP 在用户机 .env)
+      - name: Write CI .env (占位配置 —— 真实 SOAP/IP 在用户机 .env；密码按官方变量名 DOCKER_DB_ROOT_PASSWORD)
         run: |
           cd official
           cat > .env <<EOF
-          IMAGE_NS=ghcr.io/${{ github.repository_owner }}
-          DB_IMAGE=ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4
-          MYSQL_ROOT_PASSWORD=ci-test
-          REALM_ADDRESS=127.0.0.1
-          # 云端测试用占位值验证整栈能起（核心/模组配置不影响部署就随便填）
+          DOCKER_DB_ROOT_PASSWORD=ci-test
+          # 云端测试用占位值验证整栈能起（核心/模组配置不影响部署就随便填；真实 SOAP/IP 在用户机 .env）
           SOAP_LOGIN=ci-test
           SOAP_PASSWORD=ci-test
           EOF
           echo "== .env written =="; cat .env
 
-      - name: Write CI test override (绑定挂载 etc/data，禁用 ac-extra-config / ac-client-data-init 镜像)
+      - name: Write CI test override (仅 4 主镜像换源 ghcr；ac-database 用官方 mysql:8.4，ac-client-data-init 按官方 build 从 wowgaming 拉地图)
         run: |
           cd official
-          # 官方 worldserver 依赖 ac-client-data-init（其负责填命名卷 ac-client-data）；
-          # 此处改为绑定挂载 ./env/dist/data 并去掉该依赖，禁用两个镜像服务（它们本就不该是镜像）。
+          # 严格按官方 Playerbot 流程：官方 docker-compose.yml 原样起栈，仅把 4 个 server 镜像
+          # (worldserver/authserver/db-import/tools) 的来源从 Docker Hub 官方换成我们带模组/补丁的 ghcr 镜像；
+          # ac-database 保持官方 mysql:8.4，ac-client-data-init 保持官方 build(client-data target 从 wowgaming 拉地图)——
+          # 这两个服务不 override，完全照搬官方，确保部署链路与官方一致。
           cat > ci-test-override.yml <<EOF
           services:
+            ac-db-import:
+              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-db-import:latest
+              build: null
             ac-worldserver:
-              depends_on:
-                ac-database:
-                  condition: service_healthy
-                ac-db-import:
-                  condition: service_completed_successfully
-              volumes:
-                - ${{ github.workspace }}/official/env/dist/data:/azerothcore/env/dist/data:ro
-            ac-extra-config:
-              profiles: ["_disabled"]
-            ac-client-data-init:
-              profiles: ["_disabled"]
+              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-worldserver:latest
+              build: null
+            ac-authserver:
+              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-authserver:latest
+              build: null
+            ac-tools:
+              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-tools:latest
+              build: null
           EOF
           echo "== ci-test-override.yml =="; cat ci-test-override.yml
 
-      - name: Bring up stack (official compose + CI test override)
+      - name: Bring up stack (官方 compose + CI test override；--build 仅 build ac-client-data-init，4 主镜像已 build:null 用 ghcr)
         run: |
           cd official
-          docker compose -f docker-compose.yml -f ci-test-override.yml up -d
+          docker compose -f docker-compose.yml -f ci-test-override.yml up -d --build
           docker compose -f docker-compose.yml -f ci-test-override.yml ps
 
       - name: Expose db-import errors (collect ALL, no early exit; 未退出也判 FAIL)
