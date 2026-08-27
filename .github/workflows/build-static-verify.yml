@@ -123,6 +123,54 @@ jobs:
           docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4"
           docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:latest"
 
+      - name: Build & push ac-maps (ghcr.io, 社区预提取地图; 名称无 ac-wotlk- 前缀，与 override / build-maps.yml 一致)
+        # 真实镜像名 = ac-maps（不是 ac-wotlk-ac-maps），否则 deploy-test 拉取 manifest unknown
+        run: |
+          set -e
+          cd "${{ github.workspace }}/acore-build-repo"
+          CLIENT_DATA_REF=v20.0
+          echo "Downloading https://github.com/wowgaming/client-data/releases/download/$CLIENT_DATA_REF/Data.zip"
+          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/$CLIENT_DATA_REF/Data.zip"
+          mkdir -p config/maps/data
+          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
+          unzip -q /tmp/data.zip -d /tmp/extracted
+          if [ -d /tmp/extracted/Data ]; then
+            mv /tmp/extracted/Data/* config/maps/data/
+          else
+            mv /tmp/extracted/* config/maps/data/
+          fi
+          VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
+          TAGS="ghcr.io/${{ github.repository_owner }}/ac-maps:$VERSION,ghcr.io/${{ github.repository_owner }}/ac-maps:latest"
+          BUILDX_TAGS=""
+          IFS=',' read -ra _arr <<< "$TAGS"
+          for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
+          docker buildx build $BUILDX_TAGS --push config/maps
+          rm -rf config/maps/data /tmp/data.zip /tmp/extracted
+
+      - name: Build & push ac-extra-config (ghcr.io, 名称无 ac-wotlk- 前缀)
+        run: |
+          set -e
+          cd "${{ github.workspace }}/acore-build-repo"
+          VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
+          TAGS="ghcr.io/${{ github.repository_owner }}/ac-extra-config:$VERSION,ghcr.io/${{ github.repository_owner }}/ac-extra-config:latest"
+          BUILDX_TAGS=""
+          IFS=',' read -ra _arr <<< "$TAGS"
+          for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
+          docker buildx build $BUILDX_TAGS --push config/extra-config
+
+      - name: Set ac-maps / ac-extra-config package visibility public
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for p in ac-maps ac-extra-config; do
+            curl -sS -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/packages/container/${{ github.repository_owner }}%2F$p/visibility" \
+              -d '{"visibility":"public"}'
+          done
+
   # =========================================================================
   # 门 2：deploy-test（部署门，needs: build → 编译干净才跑；fail-loud）
   # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，挂 ac-maps 卷，云端 .env 用占位 SOAP 验证栈能起）
@@ -166,8 +214,8 @@ jobs:
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
           fail=0
-          for t in worldserver authserver db-import mysql ac-maps ac-extra-config; do
-            if docker pull "$NS/ac-wotlk-$t:latest"; then
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-mysql ac-maps ac-extra-config; do
+            if docker pull "$NS/$t:latest"; then
               echo "pulled $t"
             else
               echo "!! FAILED to pull $t"; fail=1
@@ -320,12 +368,12 @@ jobs:
           name: ac-db-data
           path: ${{ github.workspace }}
 
-      - name: Pull 6 images + ac-maps (5 主镜像 + ac-extra-config 进大包；ac-maps 单独打包不进大包，此处仍 pull 以便单独 save)
+      - name: Pull 7 images (5 主镜像 + ac-extra-config 进大包；ac-maps 单独打包不进大包，此处仍 pull 以便单独 save)
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
-          for t in worldserver authserver db-import tools mysql ac-maps ac-extra-config; do
-            docker pull "$NS/ac-wotlk-$t:latest"
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-maps ac-extra-config; do
+            docker pull "$NS/$t:latest"
           done
 
       - name: Save all images + frozen DB into one big bundle
@@ -345,16 +393,16 @@ jobs:
         run: |
           set -e
           NS="ghcr.io/${{ github.repository_owner }}"
-          IMAGES="worldserver authserver db-import tools mysql ac-extra-config"
+          IMAGES="ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-extra-config"
           mkdir -p /tmp/bundle
-          docker save $(for t in $IMAGES; do echo "$NS/ac-wotlk-$t:latest"; done) -o /tmp/bundle/images.tar
+          docker save $(for t in $IMAGES; do echo "$NS/$t:latest"; done) -o /tmp/bundle/images.tar
           cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
           ls -lh /tmp/bundle/
           tar -cf ac-bundle-latest.tar.zst -I zstd -C /tmp/bundle .
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
           ls -lh ac-bundle-latest.tar.zst
-          # 地图单独打包（不进大包，便于单独更新/下载）
-          docker save "$NS/ac-wotlk-ac-maps:latest" -o /tmp/ac-maps.tar
+          # 地图单独打包（不进大包，便于单独更新/下载；真实名 ac-maps，无 ac-wotlk- 前缀）
+          docker save "$NS/ac-maps:latest" -o /tmp/ac-maps.tar
           zstd -c /tmp/ac-maps.tar -o ac-maps-latest.tar.zst
           sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
           ls -lh ac-maps-latest.tar.zst
@@ -373,11 +421,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for t in worldserver authserver db-import tools mysql; do
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-maps ac-extra-config; do
             curl -sS -X PATCH \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/user/packages/container/${{ github.repository_owner }}%2Fac-wotlk-$t/visibility" \
+              "https://api.github.com/user/packages/container/${{ github.repository_owner }}%2F$t/visibility" \
               -d '{"visibility":"public"}'
           done
 
@@ -408,4 +456,4 @@ jobs:
               if gh api -X DELETE "$base/$e/versions/$vid" >/dev/null 2>&1; then echo "  deleted $vid"; else echo "  FAILED $vid"; fi
             done
           }
-          for t in worldserver authserver db-import tools mysql; do prune "$owner/ac-wotlk-$t"; done
+          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql ac-maps ac-extra-config; do prune "$owner/$t"; done

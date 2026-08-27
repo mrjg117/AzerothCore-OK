@@ -40,13 +40,13 @@ R1–R5（已在 192.168.10.99 服务端**手工**修复，但**未固化进仓�
 ## 4.5 冻库（方案B）与用户机部署（本次新增）
 - **冻库方式 = 方案B（冷拷数据目录）**：部署门干净后，`docker compose stop ac-database` 优雅停库 → `docker cp` 拷出 `/var/lib/mysql` 整个目录 → `tar -I zstd` 压成 `ac-db-data.tar.zst` → 作为 artifact 传给 package 并进大包。
 - **为什么选 B 而非 A**：大包已含 `ac-wotlk-mysql:8.4` 镜像，用户机 MySQL 版本与云上完全一致，B 的「版本绑定」副作用被消除；用户机 load 后直接挂上即可，**零重导**（A 还需多一条还原命令）。若日后用户换 MySQL 大版本，再退回 A（mysqldump）兜底。
-- **大包内容**：`ac-bundle-latest.tar.zst` = 6 个镜像(worldserver/authserver/db-import/tools/mysql/ac-extra-config) 的 `docker save` tar + `ac-db-data.tar.zst`；地图单独：`ac-maps-latest.tar.zst` = `ac-wotlk-ac-maps:latest` 的 `docker save`。
+- **大包内容**：`ac-bundle-latest.tar.zst` = 6 个镜像(worldserver/authserver/db-import/tools/mysql/ac-extra-config) 的 `docker save` tar + `ac-db-data.tar.zst`；地图单独：`ac-maps-latest.tar.zst` = `ac-maps:latest` 的 `docker save`（真实镜像名无 `ac-wotlk-` 前缀）。
 - **用户机部署步骤（极简）**：① `docker load` 两个包（大包 images.tar + 地图包）；② 把 `ac-db-data.tar.zst` 解压进 mysql 数据卷（**解压≠重导**，秒级，直接挂上即用）；③ `compose up`。db-import 在用户机仍会随 `up` 跑（官方流程），但库已完整，它幂等重放、基本空转（靠 `updates` 日志 + `IF NOT EXISTS` 跳过已应用项）；若不想让它跑，用户可去掉 compose 里的 `ac-db-import` 服务——**注意同时删 worldserver/authserver 里 `depends_on: ac-db-import`，否则 compose 报悬空依赖**。
 - **偏离官方之处（用户明确要求）**：官方每次 `compose up` 都重跑 db-import 导数据；本流程改为「云上导一次、冻进包、用户机免导」。官方流程仍用于云上「构建+测试+验证」阶段（db-import 照跑、照抓错），只改了「交付物」形态。
 - **体积预警**：大包(5主镜像+ac-extra-config+冻库)可能 ~4–6GB；地图单独包 ac-maps ~3.24GB。两者分开传/下，地图可单独更新，属预期。
 
 ## 5. 首跑前置（必看，否则部署门直接挂）
-- `ac-maps` / `ac-extra-config` 由仓库自带 `build-maps.yml` / `build-config` 工作流产出（手动或定时跑一次即可），本工作流直接 `pull`：`ac-extra-config` 进大包，`ac-maps` 单独成地图包——是仓库独立 CI，不是用户手动步骤，不构成"另拉"。
+- `ac-maps` / `ac-extra-config` **由本工作流在 build 门内自建并推送**（自包含，不依赖预先跑 `build-maps.yml` / `build-config`）：`ac-maps` = 下载 `wowgaming/client-data@v20.0` 的 `Data.zip` 烤入（`CLIENT_DATA_REF` 在 build 步固定）；`ac-extra-config` = 构建 `config/extra-config`（其 `docker-entrypoint.sh` 运行时读 `${SOAP_PASSWORD}` 注入 `worldserver.conf`）。两者进 ghcr 后 deploy-test 拉取、package 并入包，用户机无需另拉。
 - **云端测试不配真实 SOAP**：工作流 `.env` 用占位值 `ci-test`；真实 `SOAP_LOGIN/PASSWORD` 与 `REALM_ADDRESS` 在**用户机 `.env`** 提供（`ac-extra-config` 运行时读 `${SOAP_PASSWORD}` 注入 `worldserver.conf`）。CI 无需配 SOAP secrets。
 - runner 磁盘：部署吃 18–21GB，建议加 `free_disk.sh` 腾空间；内存 worldserver ~8GiB + MySQL ~1GiB。
 - 部署门对"镜像缺失 / 容器未起来"也判 FAIL（拉镜像失败即 exit 1；db-import 未在超时内 exited、worldserver 未初始化且未捕获崩溃也判 FAIL），避免假阴性漏报。
@@ -59,4 +59,4 @@ R1–R5（已在 192.168.10.99 服务端**手工**修复，但**未固化进仓�
 
 ## 7. 触发与产物
 - `workflow_dispatch` 手动触发（默认）；schedule 段留了每日/每周/每月模板，按需解注释。
-- 产物：`ac-bundle-latest.tar.zst`（大包）+ `ac-maps-latest.tar.zst`（地图）均传外置储存，ghcr 五个包设公开，保留最新 12 版。
+- 产物：`ac-bundle-latest.tar.zst`（大包）+ `ac-maps-latest.tar.zst`（地图）均传外置储存，ghcr 七个包（5 主镜像 + ac-maps + ac-extra-config）设公开，保留最新 12 版。
