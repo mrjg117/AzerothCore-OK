@@ -1,97 +1,81 @@
 name: build-static-verify
 
-# 新建流程（不动 build-core.yml）。
-# 门控模型（按用户要求）：
-#   - 编译门：官方 docker buildx 整体静态编译（core+40模块）。任何编译报错都算失败（最终必须整体无错）；
-#     失败 → 停在编译门，不进部署（needs 链阻断 deploy-test / package，编坏无镜像可测）。
-#   - 部署门：仅编译干净才跑（needs: build）。官方 compose up 起全栈，grep 收全 db-import / worldserver 错误，
-#     任一有错 → 停部署门，不冻库、不打包。
-#   - 打包：仅两门都干净才跑（needs: [build, deploy-test]）。
-#   = 即「编译出错编译完成前停查一遍错 → 再测部署 → 部署出错再查部署 → 都干净才完成打包」；每道门内收全错误。
-# 「参照以前」= build 步与 package 步原样复用 build-core.yml 的 clone/40模块/Apply build-patches/CMODULES=static/push/bundle+upload。
-# 「一切用官方流程」= 不替换官方 Dockerfile/compose/db-import；仅在官方流程之上叠错误暴露（grep 日志），官方流程完整还原。
+# 纯官方流程搬到云：把你在本地跑官方 Playerbot 部署那套，原样在 Actions 上跑一遍。
+# 唯一叠加：暴露错误(grep 部署日志) + 全干净才冻库打包分发。完全不破坏官方逻辑。
 #
-# 配置 / 地图不打包成镜像（用户纠正）：
-#   - 配置：就在仓库 config/extra-config/confs/，CI 直接把占位符填占位值 ci-test（测试只验部署链路，不较真配置）
-#     后绑定挂载进 ./env/dist/etc（与官方 etc 绑定挂载机制一致），不构建 ac-extra-config 镜像。
-#   - 地图：保留官方 ac-client-data-init 服务（按官方 build: client-data target 从 wowgaming/client-data 拉 Data.zip 填命名卷 ac-client-data），
-#     不 pull 外部镜像、不建自定义镜像（该服务本就走官方 build 流程）。
-#   - 打包：5 主镜像(worldserver/authserver/db-import/tools/mysql) + etc.tar.zst(配置模板) + ac-db-data.tar.zst(冻库)
-#     并进 ac-bundle-latest.tar.zst；地图 data.tar.zst 单独成 ac-maps-latest.tar.zst（便于单独更新/下载，不进大包）。
-#   - 用户机：docker load 两包 → 解压数据库进卷、解压 etc/data 到 ./env/dist/{etc,data} →
-#     deploy/inject-config.sh 用本机 .env 替换 SOAP 占位符 → docker compose -f docker-compose.bundle.yml up -d = 满状态。
+# 官方 = mod-playerbots/azerothcore-wotlk @Playerbot 的 docker-compose.yml + Dockerfile
+#   - Dockerfile 第 51 行 ARG CMODULES="static" → 官方本就 static，不覆盖、不传参。
+#   - 挂载 AzerothCore-OK 的 config/modules.txt 模组 + build-patches/ 补丁（项目侧输入，官方流程之上的必要内容）。
+#   - 不碰 ghcr：分发靠 tarball 大包（docker save 本地镜像 + 冻库 + 配置 + 地图），不靠 registry。
+#
+# 流程（单 job，镜像本地复用，不跨 job 搬）：
+#   1) Clone 官方核心 @Playerbot
+#   2) 挂 40 模组 + apply build-patches            （项目输入）
+#   3) 准备 etc 配置（叠仓库模组 conf，核心 conf 用官方默认）
+#   4) docker compose build --profile tools         （官方编译，遇错即停 = 编译错停在编译）
+#   5) docker compose up -d --no-build              （官方部署，遇错即停 = 部署错停在部署）
+#   6) grep 暴露 db-import / worldserver 错误        （收全错误，不早退）
+#   7) 全干净才冻库（停 mysql→拷数据目录→压）+ 打包（5 镜像 + etc + 冻库 + 地图）→ 上传
+#   任一步失败 → 后续不跑（不冻库不打包），日志全暴露。
 
 on:
   workflow_dispatch:
-  # 定期打包：取消注释启用，三选一（默认只手动）
-  # schedule:
-  #   - cron: '0 4 * * *'     # 每日 04:00 UTC
-  #   - cron: '0 4 * * 1'     # 每周一 04:00 UTC
-  #   - cron: '0 4 1 * *'     # 每月 1 号 04:00 UTC
+  push:
+    branches: [main]
+    paths:
+      - 'config/**'
+      - 'build-patches/**'
+      - 'client-patches/**'
+      - '.github/workflows/build-static-verify.yml'
 
 permissions:
   contents: read
   actions: write
-  packages: write
 
 env:
   ACORE_REF: Playerbot
   CLIENT_DATA_REF: v20.0
 
 jobs:
-  # =========================================================================
-  # 门 1：build（编译门，fail-loud）
-  # 复用 build-core.yml：clone Playerbot fork + 40 模块 + Apply build-patches + docker buildx CMODULES=static + push ghcr
-  # 任何编译报错 = 本 job 失败（最终必须整体无错）；官方编译遇错即非零退出（分段查错模型）。
-  # 失败 → 停在编译门（needs 链阻断 deploy-test / package，无镜像可测）。
-  # 只编 5 主镜像（worldserver/authserver/db-import/tools/mysql），不编 ac-maps / ac-extra-config（那俩不是镜像，见头部说明）。
-  # =========================================================================
-  build:
+  build-and-verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
     steps:
-      - name: Checkout this repo
+      - name: Checkout project (AzerothCore-OK)
         uses: actions/checkout@v4
         with:
-          path: acore-build-repo
+          path: project
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Clone Playerbot fork (mod-playerbots/azerothcore-wotlk) @ ${{ env.ACORE_REF }}
+      - name: Clone official Playerbot core @ ${{ env.ACORE_REF }}
         run: |
+          set -e
           git clone --depth 1 https://github.com/mod-playerbots/azerothcore-wotlk.git official
           cd official
           git fetch --depth 1 origin "$ACORE_REF"
           git checkout "$ACORE_REF"
+          echo "== cloned official core @ $ACORE_REF =="
 
-      - name: Clone 40 modules (strip -master suffix)
+      - name: Mount modules (config/modules.txt) + apply build-patches
         run: |
+          set -e
           cd official
+          # 挂模组：读项目 config/modules.txt，逐个 clone 进 modules/（去 -master 后缀）
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             case "$url" in \#*) continue;; esac
             name=$(basename "$url" .git); name=${name%-master}
             echo "-> $url => modules/$name"
             git clone --depth 1 "$url" "modules/$name"
-          done < ../acore-build-repo/config/modules.txt
-
-      - name: Apply build-patches (per-module, convention auto-detect)
-        run: |
-          set -e
-          BP="${{ github.workspace }}/acore-build-repo/build-patches"
-          OFF="${{ github.workspace }}/official"
+          done < ../project/config/modules.txt
+          # apply 核心/模组 build-patches（项目侧补丁，官方流程之上的输入）
+          BP="${{ github.workspace }}/project/build-patches"
           for moddir in "$BP"/*/; do
             [ -d "$moddir" ] || continue
             name=$(basename "$moddir")
-            if [ "$name" = "core" ]; then tgt="$OFF"; else tgt="$OFF/modules/$name"; fi
+            if [ "$name" = "core" ]; then tgt="$PWD"; else tgt="$PWD/modules/$name"; fi
             [ -d "$tgt" ] || { echo "!! target $tgt not found, skip $name"; continue; }
             echo "== build-patches: $name -> $tgt =="
             for p in $(ls "$moddir"*.patch 2>/dev/null | sort); do
@@ -107,304 +91,123 @@ jobs:
               cp -r "$moddir/overlay/." "$tgt/"
             fi
           done
-          echo "build-patches applied"
+          echo "modules mounted + patches applied"
 
-      - name: Build & push 4 official server targets (ghcr.io, CMODULES=static)
-        # 官方 Dockerfile 内部 cmake/ninja；遇任一编译错即非零退出（最终必须整体无错）。保持与 build-core.yml 完全一致。
-        run: |
-          cd official
-          VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
-          CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max"
-          for t in worldserver authserver db-import tools; do
-            TAGS="ghcr.io/${{ github.repository_owner }}/ac-wotlk-$t:$VERSION,ghcr.io/${{ github.repository_owner }}/ac-wotlk-$t:latest"
-            BUILDX_TAGS=""
-            IFS=',' read -ra _arr <<< "$TAGS"
-            for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
-            docker buildx build $CACHE --target "$t" -f apps/docker/Dockerfile --build-arg CMODULES=static $BUILDX_TAGS --push .
-          done
-
-      - name: Pull & push mysql:8.4 to ghcr (ac-wotlk-mysql)
-        continue-on-error: true
-        run: |
-          docker pull mysql:8.4
-          docker tag mysql:8.4 "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4"
-          docker tag mysql:8.4 "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:latest"
-          docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:8.4"
-          docker push "ghcr.io/${{ github.repository_owner }}/ac-wotlk-mysql:latest"
-
-  # =========================================================================
-  # 门 2：deploy-test（部署门，needs: build → 编译干净才跑；fail-loud）
-  # 官方流程完整还原：官方 compose up（mysql→db-import→authserver→worldserver，绑挂载地图/配置，云端用占位值验证栈能起）
-  # 不构建/不拉 ac-maps、ac-extra-config 镜像（注：官方 compose 本就无 ac-extra-config 服务，配置走 ./env/dist/etc 绑定挂载）：
-  #   - 配置 = 仓库 config/extra-config/confs 模组段扁平化 + sed 填占位值 ci-test → 绑定挂载 ./env/dist/etc
-  #   - 地图 = 保留官方 ac-client-data-init 服务（按官方 build client-data target 从 wowgaming/client-data 拉 Data.zip 填命名卷 ac-client-data，不 override 其 build）
-  # 错误暴露（在官方流程之上，且「收全」不遇首错即退）：
-  #   - db-import 跑完 grep 日志 Unhandled/errno/does not exist/Duplicate entry/truncated → 官方 dbimport 非 fail-fast，必须靠 grep 抓「带病 exit 0」
-  #   - worldserver 等 "WORLD Initialized"，再 grep ABORT/Could not prepare/Table ... doesn't exist
-  #   同时检测「镜像缺失/容器未起来」（拉镜像失败即 exit 1；db-import 未退出/worldserver 未初始化也判 FAIL），杜绝假阴性。
-  #   所有命中先打印、累计 FAIL 标志，最后统一判定（不中途退，保证全部错误都暴露）
-  # 任一 FAIL>0 → 本 job 失败 → 停部署门，package 被 needs 链阻断（不冻库、不打包）
-  # 部署门干净 → 冻库（方案B：优雅停库→拷数据目录→压缩）→ 作为 artifact 传给 package 并进大包
-  # =========================================================================
-  deploy-test:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-        with:
-          path: acore-build-repo
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Clone Playerbot fork (need official base docker-compose.yml)
-        run: |
-          git clone --depth 1 https://github.com/mod-playerbots/azerothcore-wotlk.git official
-          cd official
-          git fetch --depth 1 origin "$ACORE_REF"
-          git checkout "$ACORE_REF"
-
-      - name: Pull built 5 images (缺任一即失败，不吞错)
+      - name: Prepare etc config (叠仓库模组 conf；核心 conf 用官方默认)
         run: |
           set -e
-          NS="ghcr.io/${{ github.repository_owner }}"
-          fail=0
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do
-            if docker pull "$NS/$t:latest"; then
-              echo "pulled $t"
-            else
-              echo "!! FAILED to pull $t"; fail=1
-            fi
-          done
-          [ "$fail" = "0" ] || { echo "!! 缺失镜像，部署无法继续"; exit 1; }
-
-      - name: Prepare config (仓库模组 conf 叠加 → ./env/dist/etc；核心 conf 用官方默认)
-        run: |
-          set -e
-          OFF="${{ github.workspace }}/official"
-          ETC="$OFF/env/dist/etc"
+          ETC="${{ github.workspace }}/official/env/dist/etc"
           mkdir -p "$ETC"
           # 仅叠加模组 conf；核心 worldserver.conf/authserver.conf 用官方镜像默认（entrypoint 自动复制），不覆盖以免破坏 DB 连接等默认设置
-          for f in $(find "${{ github.workspace }}/acore-build-repo/config/extra-config/confs" -type f -name '*.conf'); do
+          for f in $(find "${{ github.workspace }}/project/config/extra-config/confs" -type f -name '*.conf'); do
             b=$(basename "$f")
             case "$b" in worldserver.conf|authserver.conf) continue;; esac
             cp "$f" "$ETC/$b"
           done
-          sed -i 's/__SOAP_LOGIN__/ci-test/g; s/__SOAP_PASSWORD__/ci-test/g' "$ETC"/*.conf 2>/dev/null || true
           echo "== prepared etc =="; ls -1 "$ETC"
 
-      - name: Write CI .env (占位配置 —— 真实 SOAP/IP 在用户机 .env；密码按官方变量名 DOCKER_DB_ROOT_PASSWORD)
+      - name: Write CI .env (占位值，仅验部署链路；密码按官方变量名 DOCKER_DB_ROOT_PASSWORD)
         run: |
-          cd official
-          cat > .env <<EOF
-          DOCKER_DB_ROOT_PASSWORD=ci-test
-          # 云端测试用占位值验证整栈能起（核心/模组配置不影响部署就随便填；真实 SOAP/IP 在用户机 .env）
-          SOAP_LOGIN=ci-test
-          SOAP_PASSWORD=ci-test
-          EOF
+          set -e
+          cd "${{ github.workspace }}/official"
+          printf 'DOCKER_DB_ROOT_PASSWORD=ci-test\nSOAP_LOGIN=ci-test\nSOAP_PASSWORD=ci-test\n' > .env
           echo "== .env written =="; cat .env
 
-      - name: Write CI test override (仅 4 主镜像换源 ghcr；ac-database 用官方 mysql:8.4，ac-client-data-init 按官方 build 从 wowgaming 拉地图)
+      - name: Build core images (官方编译，遇错即停 = 编译错停在编译)
         run: |
-          cd official
-          # 严格按官方 Playerbot 流程：官方 docker-compose.yml 原样起栈，仅把 4 个 server 镜像
-          # (worldserver/authserver/db-import/tools) 的来源从 Docker Hub 官方换成我们带模组/补丁的 ghcr 镜像；
-          # ac-database 保持官方 mysql:8.4，ac-client-data-init 保持官方 build(client-data target 从 wowgaming 拉地图)——
-          # 这两个服务不 override，完全照搬官方，确保部署链路与官方一致。
-          cat > ci-test-override.yml <<EOF
-          services:
-            ac-db-import:
-              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-db-import:latest
-              build: null
-            ac-worldserver:
-              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-worldserver:latest
-              build: null
-            ac-authserver:
-              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-authserver:latest
-              build: null
-            ac-tools:
-              image: ghcr.io/${{ github.repository_owner }}/ac-wotlk-tools:latest
-              build: null
-          EOF
-          echo "== ci-test-override.yml =="; cat ci-test-override.yml
+          set -e
+          cd "${{ github.workspace }}/official"
+          # 官方 CMODULES 默认 static（Dockerfile ARG），不覆盖。--profile tools 一并编 tools（进大包用）。
+          docker compose build --profile tools
+          echo "== build done =="
 
-      - name: Bring up stack (官方 compose + CI test override；--build 仅 build ac-client-data-init，4 主镜像已 build:null 用 ghcr)
+      - name: Bring up stack (官方部署)
         run: |
-          cd official
-          docker compose -f docker-compose.yml -f ci-test-override.yml up -d --build
-          docker compose -f docker-compose.yml -f ci-test-override.yml ps
+          set -e
+          cd "${{ github.workspace }}/official"
+          # --no-build：用刚编好的本地镜像起栈；mysql:8.4 / client-data(从 wowgaming 拉地图) 按官方现场来
+          docker compose up -d --no-build
+          docker compose ps
 
-      - name: Expose db-import errors (collect ALL, no early exit; 未退出也判 FAIL)
-        if: always()
-        run: |
-          cd official
-          CF="docker-compose.yml -f ci-test-override.yml"
-          DI_SEEN=0
-          for i in $(seq 1 60); do
-            st=$(docker compose -f $CF ps ac-db-import --status exited -q 2>/dev/null)
-            [ -n "$st" ] && { DI_SEEN=1; break; }
-            sleep 5
-          done
-          docker compose -f $CF logs ac-db-import > /tmp/dbimport.log 2>&1 || true
-          echo "==== db-import log tail ===="; tail -n 40 /tmp/dbimport.log
-          FAIL=0
-          if [ "$DI_SEEN" != "1" ]; then echo "!! db-import 未在超时内退出（镜像缺失/卡死/编排错误）"; FAIL=1; fi
-          if grep -Ei 'Unhandled|errno [0-9]|does not exist|Duplicate entry|truncated for column|Unexpected behaviour|ERROR [0-9]' /tmp/dbimport.log; then
-            echo "!! db-import 暴露错误（含带病 exit 0）"; FAIL=1
-          else
-            echo "db-import 无暴露错误"
-          fi
-          echo "DBIMPORT_FAIL=$FAIL" >> "$GITHUB_ENV"
-
-      - name: Wait worldserver initialized + expose ABORT (collect ALL, no early exit; 未初始化也判 FAIL)
-        if: always()
-        run: |
-          cd official
-          CF="docker-compose.yml -f ci-test-override.yml"
-          WS_INIT=0; WS_SEEN=0
-          for i in $(seq 1 60); do
-            if docker compose -f $CF ps ac-worldserver --status running -q >/dev/null 2>&1; then WS_SEEN=1; fi
-            if docker compose -f $CF logs ac-worldserver 2>&1 | grep -q "WORLD Initialized"; then
-              WS_INIT=1; echo "worldserver initialized after ~$((i*10))s"; break
-            fi
-            sleep 10
-          done
-          docker compose -f $CF logs ac-worldserver > /tmp/ws.log 2>&1 || true
-          echo "==== worldserver log tail ===="; tail -n 60 /tmp/ws.log
-          FAIL=0
-          if [ "$WS_SEEN" != "1" ]; then echo "!! ac-worldserver 容器未运行（镜像缺失/启动失败）"; FAIL=1; fi
-          if grep -Ei 'ABORT|Could not prepare|WORLD NOT Initialized|Table .* doesn.t exist|Unknown column|ERROR [0-9]' /tmp/ws.log; then
-            echo "!! worldserver 暴露错误"; FAIL=1
-          else
-            echo "worldserver 无暴露错误"
-          fi
-          [ "$WS_INIT" = "1" ] || { echo "!! worldserver 未在超时内初始化（可能崩溃/配置错）"; FAIL=1; }
-          echo "WS_FAIL=$FAIL" >> "$GITHUB_ENV"
-
-      - name: Deploy-test gate (FAIL>0 → 暴露全部错误并标红，不冻库不打包)
-        if: always()
-        run: |
-          D="${DBIMPORT_FAIL:-0}"; W="${WS_FAIL:-0}"
-          echo "db-import FAIL=$D  worldserver FAIL=$W"
-          if [ "$D" != "0" ] || [ "$W" != "0" ]; then
-            echo "!! 部署门暴露错误：db-import=$D worldserver=$W —— 停部署门，不冻库不打包"
-            exit 1
-          fi
-          echo "部署门无错误"
-
-      - name: Freeze database (方案B：优雅停库→拷数据目录→压缩) 仅部署门干净才到这
+      - name: Expose deployment errors (db-import + worldserver；收全不早退)
         if: success()
         run: |
-          cd official
-          CF="docker-compose.yml -f ci-test-override.yml"
+          set -e
+          cd "${{ github.workspace }}/official"
+          FAIL=0
+          # ---- db-import ----
+          DI_SEEN=0
+          for i in $(seq 1 120); do
+            if docker compose ps ac-db-import --status exited -q >/dev/null 2>&1; then DI_SEEN=1; break; fi
+            sleep 5
+          done
+          docker compose logs ac-db-import > /tmp/dbimport.log 2>&1 || true
+          echo "==== db-import log tail ===="; tail -n 50 /tmp/dbimport.log
+          if [ "$DI_SEEN" != "1" ]; then echo "!! db-import 未退出（镜像缺失/卡死/编排错误）"; FAIL=1; fi
+          if grep -Ei 'Unhandled|errno [0-9]|does not exist|Duplicate entry|truncated for column|Unexpected behaviour|ERROR [0-9]' /tmp/dbimport.log; then
+            echo "!! db-import 暴露错误（含带病 exit 0）"; FAIL=1
+          fi
+          # ---- worldserver ----
+          WS_SEEN=0; WS_ERR=0
+          for i in $(seq 1 120); do
+            docker compose ps ac-worldserver --status running -q >/dev/null 2>&1 && WS_SEEN=1
+            if docker compose logs ac-worldserver 2>&1 | grep -Eqi 'ABORT|Could not prepare|Table .* doesn.t exist|Unknown column'; then WS_ERR=1; break; fi
+            sleep 5
+          done
+          docker compose logs ac-worldserver > /tmp/ws.log 2>&1 || true
+          echo "==== worldserver log tail ===="; tail -n 80 /tmp/ws.log
+          if [ "$WS_SEEN" != "1" ]; then echo "!! worldserver 容器未运行（启动失败/崩溃）"; FAIL=1; fi
+          if [ "$WS_ERR" = "1" ]; then echo "!! worldserver 暴露错误"; FAIL=1; fi
+          if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误，停（不冻库不打包）"; exit 1; fi
+          echo "部署无错误（db-import 完成 + worldserver 运行中且无致命错误）"
+
+      - name: Freeze database (优雅停库→拷数据目录→压缩) 仅部署干净才到这
+        if: success()
+        run: |
+          set -e
+          cd "${{ github.workspace }}/official"
           echo "== graceful stop ac-database =="
-          docker compose -f $CF stop ac-database
+          docker compose stop ac-database
           for i in $(seq 1 30); do
-            if [ -z "$(docker compose -f $CF ps ac-database --status running -q 2>/dev/null)" ]; then echo "db stopped"; break; fi
+            docker compose ps ac-database --status running -q >/dev/null 2>&1 || { echo "db stopped"; break; }
             sleep 2
           done
-          CID=$(docker compose -f $CF ps -q ac-database)
+          CID=$(docker compose ps -q ac-database)
           echo "db container id=$CID"
           mkdir -p /tmp/dbdata
           docker cp "$CID:/var/lib/mysql/." /tmp/dbdata/
           tar -cf "${{ github.workspace }}/ac-db-data.tar.zst" -I zstd -C /tmp/dbdata .
           ls -lh "${{ github.workspace }}/ac-db-data.tar.zst"
 
-      - name: Upload frozen DB as artifact (供 package 并入大包)
+      - name: Package (5 镜像 + etc + 冻库 + 地图；全干净才打)
         if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ac-db-data
-          path: ${{ github.workspace }}/ac-db-data.tar.zst
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: Tear down (数据已冻进 artifact，此处可删卷)
-        if: always()
-        run: |
-          cd official
-          docker compose -f docker-compose.yml -f ci-test-override.yml down -v || true
-
-  # =========================================================================
-  # package（needs: [build, deploy-test] → 两门都干净才跑；原样复用 build-core.yml 的 bundle/upload 步，
-  #   并把 配置(etc.tar.zst) + 冻好的数据库(ac-db-data.tar.zst) 一并并进同一个大包；地图(data.tar.zst)单独成包）
-  # 配置/地图不再作为镜像：配置从仓库 confs 扁平化 tarball，地图从 wowgaming 下载解压 tarball。
-  # =========================================================================
-  package:
-    needs: [build, deploy-test]
-    runs-on: ubuntu-latest
-    timeout-minutes: 150
-    steps:
-      - name: GATE — 确认两门干净才打包
-        run: |
-          echo "build=${{ needs.build.result }}  deploy-test=${{ needs.deploy-test.result }}"
-          echo "两门均成功 → 开始打包（完成）"
-
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-        with:
-          path: acore-build-repo
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download frozen DB artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ac-db-data
-          path: ${{ github.workspace }}
-
-      - name: Pull 5 images (进大包)
         run: |
           set -e
-          NS="ghcr.io/${{ github.repository_owner }}"
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do
-            docker pull "$NS/$t:latest"
-          done
-
-      - name: Build config tarball (仓库 confs 扁平化 + 占位符保留供用户机替换)
-        run: |
-          set -e
+          cd "${{ github.workspace }}/official"
+          mkdir -p /tmp/bundle
+          # 5 主镜像（官方 tag：docker compose build 编出的本地镜像名）
+          docker save \
+            acore/ac-wotlk-worldserver:master \
+            acore/ac-wotlk-authserver:master \
+            acore/ac-wotlk-db-import:master \
+            acore/ac-wotlk-tools:master \
+            mysql:8.4 \
+            -o /tmp/bundle/images.tar
+          zstd -o /tmp/bundle/images.tar.zst /tmp/bundle/images.tar && rm /tmp/bundle/images.tar
+          # etc（仓库 confs，保留 __SOAP_*__ 占位符供用户机替换）
           mkdir -p /tmp/bundle/etc
-          for f in $(find "${{ github.workspace }}/acore-build-repo/config/extra-config/confs" -type f -name '*.conf'); do
+          for f in $(find "${{ github.workspace }}/project/config/extra-config/confs" -type f -name '*.conf'); do
             cp "$f" "/tmp/bundle/etc/$(basename "$f")"
           done
-          # 保留 __SOAP_*__ 占位符（不替换），用户机 deploy/inject-config.sh 用本机 .env 替换
           tar -cf /tmp/bundle/etc.tar.zst -I zstd -C /tmp/bundle/etc .
-          ls -lh /tmp/bundle/etc.tar.zst
+          # 冻库
+          cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
+          # 地图（从官方 client-data 卷导出）
+          docker run --rm -v ac-client-data:/data -v /tmp/bundle:/out busybox tar -cf - -C /data . | zstd -o /tmp/bundle/ac-maps.tar.zst
+          echo "== bundle contents =="; ls -lh /tmp/bundle/
 
-      - name: Build maps tarball (地图单独包：直接从 wowgaming/client-data 下载解压)
-        run: |
-          set -e
-          mkdir -p /tmp/maps
-          echo "Downloading https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
-          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/${{ env.CLIENT_DATA_REF }}/Data.zip"
-          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
-          unzip -q /tmp/data.zip -d /tmp/extracted
-          if [ -d /tmp/extracted/Data ]; then
-            mv /tmp/extracted/Data/* /tmp/maps/
-          else
-            mv /tmp/extracted/* /tmp/maps/
-          fi
-          rm -rf /tmp/data.zip /tmp/extracted
-          tar -cf ac-maps-latest.tar.zst -I zstd -C /tmp/maps .
-          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
-          ls -lh ac-maps-latest.tar.zst
-
-      - name: Save all images + config + frozen DB into one big bundle
+      - name: Build final tarballs + upload
+        if: success()
         env:
           ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
           ONEDRIVE_TENANT: ${{ secrets.ONEDRIVE_TENANT }}
@@ -420,64 +223,21 @@ jobs:
           S3_REGION: ${{ secrets.S3_REGION }}
         run: |
           set -e
-          NS="ghcr.io/${{ github.repository_owner }}"
-          IMAGES="ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql"
-          mkdir -p /tmp/bundle
-          docker save $(for t in $IMAGES; do echo "$NS/$t:latest"; done) -o /tmp/bundle/images.tar
-          cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
-          cp /tmp/bundle/etc.tar.zst /tmp/bundle/
-          ls -lh /tmp/bundle/
-          tar -cf ac-bundle-latest.tar.zst -I zstd -C /tmp/bundle .
+          cd /tmp/bundle
+          tar -cf "${{ github.workspace }}/ac-bundle-latest.tar.zst" -I zstd -C /tmp/bundle .
+          cp /tmp/bundle/ac-maps.tar.zst "${{ github.workspace }}/ac-maps-latest.tar.zst"
+          cd "${{ github.workspace }}"
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
-          ls -lh ac-bundle-latest.tar.zst
-          if [ -n "$S3_BUCKET" ]; then
-            curl -sSfL https://rclone.org/install.sh | sudo bash
-            command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
-          fi
+          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
+          ls -lh ac-bundle-latest.tar.zst ac-maps-latest.tar.zst
           pip install --quiet msal 2>/dev/null || true
-          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
-          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
-          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
-          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
 
-      - name: Set package visibility public (仅 5 主镜像)
+      - name: Tear down (数据已冻进包，此处删卷)
         if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do
-            curl -sS -X PATCH \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/user/packages/container/${{ github.repository_owner }}%2F$t/visibility" \
-              -d '{"visibility":"public"}'
-          done
-
-      - name: Prune old versions (keep latest 12)
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KEEP: "12"
-        run: |
-          set +e
-          owner="${{ github.repository_owner }}"
-          enc() { local s="$1"; s="${s/\//%2F}"; printf '%s' "$s"; }
-          otype=$(gh api "users/$owner" --jq '.type' 2>/dev/null)
-          if [ "$otype" = "Organization" ]; then base="orgs/$owner/packages/container"; else base="user/packages/container"; fi
-          prune() {
-            local pkg="$1" e ids ids_arr=() n i vid
-            e=$(enc "$pkg")
-            echo "pruning $pkg (enc=$e)"
-            ids=$(gh api "$base/$e/versions?per_page=100" --jq 'sort_by(.created_at)|reverse|.[].id' 2>/dev/null)
-            if [ -z "$ids" ]; then echo "  no versions, skip"; return 0; fi
-            while IFS= read -r line; do [ -n "$line" ] && ids_arr+=("$line"); done <<< "$ids"
-            n=${#ids_arr[@]}
-            if [ "$n" -le "${KEEP}" ]; then echo "  $n <= ${KEEP}, keep all"; return 0; fi
-            echo "  $n versions, deleting $((n-KEEP)) oldest"
-            for ((i=KEEP; i<n; i++)); do
-              vid="${ids_arr[i]}"
-              if gh api -X DELETE "$base/$e/versions/$vid" >/dev/null 2>&1; then echo "  deleted $vid"; else echo "  FAILED $vid"; fi
-            done
-          }
-          for t in ac-wotlk-worldserver ac-wotlk-authserver ac-wotlk-db-import ac-wotlk-tools ac-wotlk-mysql; do prune "$owner/$t"; done
+          cd "${{ github.workspace }}/official"
+          docker compose down -v || true
