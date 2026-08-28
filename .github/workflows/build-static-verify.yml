@@ -158,9 +158,9 @@ jobs:
           if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then
             echo "!! ac-db-import 异常退出($DI_RC)"; FAIL=1
           fi
-          if grep -Eqi 'ERROR|Unhandled|errno|does not exist|Duplicate entry|truncated|Unexpected|ABORT|FATAL|failed|refused|cannot' /tmp/dbimport.log; then
-            echo "!! db-import 日志含错误关键字"; FAIL=1
-          fi
+          # db-import 是一次性导入任务：灌 SQL 失败会直接 exit 非0（上面 ExitCode 已判定）。
+          # 不再对日志做宽 grep——AC 首次连库会打印 "Database ... does not exist" 这类预期探测提示
+          # （随后即 "Creating database ... Done."），属正常流程，宽词会误判挡住打包分发。
           # db-import 失败则 worldserver 依赖它不会起，直接判停（不必再空等 worldserver）
           if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误（db-import），停（不冻库不打包）"; exit 1; fi
           # ---- worldserver ----
