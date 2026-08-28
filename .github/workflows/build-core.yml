@@ -28,14 +28,16 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        id: setup-buildx
 
       # ccache 跨 run 持久化：官方 Dockerfile 用 `RUN --mount=type=cache,target=/ccache`（BuildKit
-      # named cache）。通过 buildx --cache-to/from=type=local 把 buildkit 缓存（含 ccache 的 named
-      # cache 对象）导出/导入到 /home/runner/.cache/ccache，再由 actions/cache 跨 run 持久化，实现
-      # ccache 跨 run 复用（编译层另外走下方 gha 层缓存）。
-      # 注：曾用 build-context 只读挂载（type=bind）方案，实测写不回宿主、缓存键命中但内容空、复用失败，已废弃。
+      # named cache）。该 named cache 不被任何 --cache-to 后端导出（type=local/gha 仅导出镜像层），
+      # 故改用 reproducible-containers/buildkit-cache-dance 把宿主 /home/runner/.cache/ccache 注入/
+      # 提取进构建容器 /ccache，配合 actions/cache 跨 run 持久化，实现 ccache 真复用（编译层走 gha）。
+      # 注：type=bind 只读挂载 与 --cache-to=type=local 两方案实测均写不回宿主、缓存键命中但内容空、复用失败，已废弃。
       - name: Cache ccache (跨 run 持久化)
         uses: actions/cache@v4
+        id: cache-ccache
         with:
           path: /home/runner/.cache/ccache
           key: ccache-${{ github.sha }}
@@ -43,6 +45,16 @@ jobs:
             ccache-
 
       # 构建缓存改用 buildx 原生 GHA 缓存（--cache-from/to=type=gha）。
+
+      - name: Restore ccache cache mount (buildkit-cache-dance)
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.setup-buildx.outputs.name }}
+          cache-map: |
+            {
+              "/home/runner/.cache/ccache": "/ccache"
+            }
+          skip-extraction: ${{ steps.cache-ccache.outputs.cache-hit }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -105,10 +117,9 @@ jobs:
           mkdir -p /home/runner/.cache/ccache
           cd official
           VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
-          # gha 编 layer 缓存；local 导出/导入 buildkit 缓存（含 ccache named cache mount），
-          # 经 actions/cache 持久化到 /home/runner/.cache/ccache 实现 ccache 跨 run 复用。
-          # 已移除旧 --build-context ccache（type=bind 只读挂载写不回宿主，缓存键命中但内容空、复用失败）。
-          CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max --cache-from=type=local,src=/home/runner/.cache/ccache --cache-to=type=local,dest=/home/runner/.cache/ccache,mode=max"
+          # gha 层缓存（未改动层命中）；ccache 由 buildkit-cache-dance 经 /home/runner/.cache/ccache
+          # 注入/提取，不在此处 --cache-to/from（named cache 无法被导出）。
+          CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max"
           # 注：client-data target 由 build-maps.yml 的 ac-maps 镜像取代。
           #     mysql 镜像在本流程一并打包推送（ac-wotlk-mysql）；临时 build-mysql.yml 可单独触发，
           #     待部署稳定后删除 build-mysql.yml，mysql 仍由本流程产出。
