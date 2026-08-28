@@ -44,6 +44,8 @@ R1–R5(已在 192.168.10.99 服务端**手工**修复,但**未固化进仓库**
 - **关键**：deploy 验证步 `if: success()` 且**累计 FAIL、最后统一判定**,保证所有错误一次列全。
 - **R6（2026-08-28 暴露的设计坑）**：`docker compose up -d` 因依赖服务（db-import）退出非零会返回非 0，若 step 9 用 `set -e` 会整步 abort，导致 step 10（抓容器日志、扫描致命错误）被 `if: success()` 跳过——**db-import 内部真正的 SQL 报错看不到**。修复：step 9 用 `docker compose up -d --no-build || echo ...` 接住非零返回、不让整步 aborted；step 10 **去掉 `if: success()` 始终执行**，先 `docker inspect` 取 `ac-db-import` 真实 exit code + `cat` 打印其**完整日志** + 宽 grep 错误关键字，db-import 失败即立即判停（worldserver 依赖它不会起、不必空等）；仅 db-import 干净才继续 worldserver 检查。这样部署错真正全暴露。
 
+- **R7（2026-08-28 暴露的官方 bind-mount 权限坑）**：`ac-db-import`/`worldserver`/`authserver` 把 host 的 `./env/dist/etc` + `./env/dist/logs` **bind 挂载**进容器，容器以 `acore`(uid 1000, Dockerfile `USER $DOCKER_USER` 默认 acore)跑。CI 里 Docker 守护进程是 root，自动创建的 bind 目录是 **root 所有** → acore 写不进 → 官方 entrypoint `cp -rnv` 失败(`set -e`)→ 容器 exit 1。这**不是我们引入的**，是官方 Docker 已知坑（官方 entrypoint 警告原文即写 `sudo chown -R 1000:1000 ./env/dist/etc ./env/dist/logs` 或 `DOCKER_USER=root`）。官方本地流能跑是因为用户自己 chown 过 host 目录。修复（纯项目侧 CI 步骤，不改任何官方文件）：在 `docker compose up` 前 `mkdir -p env/dist/etc env/dist/logs && chown -R 1000:1000 env/dist`(runner 非 root 时用 `sudo`)，复刻官方本地前置条件。注意 compose 无 `user:` 字段、`DOCKER_USER` 仅是 build arg，故 `DOCKER_USER=root` 在 `--no-build` 的 `up` 下不生效——必须用 chown 方案。
+
 ## 4.5 冻库(方案B)与用户机部署
 - **冻库方式 = 方案B(冷拷数据目录)**：部署门干净后,`docker compose stop ac-database` 优雅停库 → `docker cp` 拷出 `/var/lib/mysql` 整个目录 → `tar -I zstd` 压成 `ac-db-data.tar.zst` → 并进大包。
 - **为什么选 B 而非 A**：大包已含 `mysql:8.4` 镜像,用户机 MySQL 版本与云上完全一致,B 的「版本绑定」副作用被消除;用户机 load 后直接挂上即可,**零重导**。

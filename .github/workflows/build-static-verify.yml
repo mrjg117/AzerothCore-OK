@@ -126,6 +126,14 @@ jobs:
       - name: Bring up stack (官方部署)
         run: |
           cd "${{ github.workspace }}/official"
+          # 官方 bind-mount 权限坑（官方 entrypoint 警告明写）：
+          #   ac-db-import/worldserver/authserver 把 host 的 ./env/dist/etc、./env/dist/logs 挂进容器，
+          #   容器以 acore(uid 1000) 跑；CI 里 Docker 守护进程是 root，自动创建的 bind 目录是 root 所有
+          #   -> acore 写不进 -> entrypoint `cp` 失败(set -e) -> 容器 exit 1。
+          #   官方本地流能跑是因为用户自己 `sudo chown -R 1000:1000 ./env/dist/etc ./env/dist/logs` 过。
+          #   此处复刻该官方前置条件（不改任何官方文件，纯项目侧步骤）：预建 host 目录并交给 uid 1000。
+          mkdir -p env/dist/etc env/dist/logs
+          chown -R 1000:1000 env/dist 2>/dev/null || sudo chown -R 1000:1000 env/dist
           # --no-build：用刚编好的本地镜像起栈；mysql:8.4 / client-data(从 wowgaming 拉地图) 按官方现场来
           # 注意：db-import/worldserver 任一退出非零，compose up 会返回非0；此处用 || 接住，
           #       不让整步 abort，交下一步抓取容器日志、扫描致命错误（符合“部署错全扫、暴露全部”）。
