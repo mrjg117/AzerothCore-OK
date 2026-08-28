@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 set -e
-# 官方 Dockerfile 第 83 行用 `RUN --mount=type=cache,target=/ccache,sharing=locked` 做 ccache 缓存。
-# 但 BuildKit 的 type=cache 挂载是匿名本地缓存，在 GitHub Actions 的全新 runner 上
-# 每次 run 都不保留 -> ccache 永远冷启动 -> 2159 个 .o 每次全量重编（77 分钟）。
-# 改成绑定到名为 ccache 的 build-context（由 CI 用 --build-context / additional_contexts
-# 指向经 actions/cache 持久化的目录），让 ccache 跨 run 复用。
-# 改的是 clone 副本（官方流程之上的补丁），不动官方本体。本地构建不套本补丁时仍是官方原挂载，无影响。
+# ccache 跨 run 持久化现由 buildx 负责（见 build-core.yml 的 --cache-to/from=type=local），
+# 不再通过 build-context 只读挂载（旧方案 type=bind 写不回宿主，实测缓存键命中但内容空、复用失败）。
+# 本脚本仅作为「官方 Dockerfile 仍使用 buildkit named cache mount」的守卫：
+# 若官方把 ccache 挂载写法改掉，这里会告警，提示重新评估 ccache 持久化策略。
 DF="apps/docker/Dockerfile"
 if [ ! -f "$DF" ]; then
-  echo "!! $DF not found, skip ccache patch"
+  echo "!! $DF not found, skip ccache guard"
   exit 0
 fi
 if grep -q 'type=cache,target=/ccache,sharing=locked' "$DF"; then
-  sed -i 's#type=cache,target=/ccache,sharing=locked#type=bind,from=ccache,target=/ccache,rw#' "$DF"
-  echo "patched: ccache mount -> type=bind,from=ccache (persisted via build-context)"
+  echo "ok: 官方 ccache 仍用 buildkit named cache mount（由 buildx --cache-to/from=type=local 跨 run 持久化），本补丁不改动 Dockerfile"
 else
-  echo "!! ccache mount line not found (Dockerfile 可能已改), skip"
+  echo "!! 警告：官方 ccache 挂载写法已变（不再是 type=cache,target=/ccache,sharing=locked），需重新评估 build-core.yml 的 ccache 持久化方案"
 fi

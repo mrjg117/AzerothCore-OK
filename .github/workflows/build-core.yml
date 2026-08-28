@@ -30,9 +30,10 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # ccache 跨 run 持久化：官方 Dockerfile 用 `RUN --mount=type=cache,target=/ccache`（BuildKit
-      # 匿名缓存），全新 runner 上每次 run 都丢失 -> 2159 个 .o 全量重编。core build-patch 已把该挂载
-      # 改为 `type=bind,from=ccache`，由本步骤的 actions/cache 把 /home/runner/.cache/ccache 持久化，
-      # 并注入为 build-context，实现 ccache 跨 run 复用（编译层仍走下方 gha 层缓存）。
+      # named cache）。通过 buildx --cache-to/from=type=local 把 buildkit 缓存（含 ccache 的 named
+      # cache 对象）导出/导入到 /home/runner/.cache/ccache，再由 actions/cache 跨 run 持久化，实现
+      # ccache 跨 run 复用（编译层另外走下方 gha 层缓存）。
+      # 注：曾用 build-context 只读挂载（type=bind）方案，实测写不回宿主、缓存键命中但内容空、复用失败，已废弃。
       - name: Cache ccache (跨 run 持久化)
         uses: actions/cache@v4
         with:
@@ -104,8 +105,10 @@ jobs:
           mkdir -p /home/runner/.cache/ccache
           cd official
           VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
-          CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max"
-          CCACHE_CTX="--build-context ccache=/home/runner/.cache/ccache"
+          # gha 编 layer 缓存；local 导出/导入 buildkit 缓存（含 ccache named cache mount），
+          # 经 actions/cache 持久化到 /home/runner/.cache/ccache 实现 ccache 跨 run 复用。
+          # 已移除旧 --build-context ccache（type=bind 只读挂载写不回宿主，缓存键命中但内容空、复用失败）。
+          CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max --cache-from=type=local,src=/home/runner/.cache/ccache --cache-to=type=local,dest=/home/runner/.cache/ccache,mode=max"
           # 注：client-data target 由 build-maps.yml 的 ac-maps 镜像取代。
           #     mysql 镜像在本流程一并打包推送（ac-wotlk-mysql）；临时 build-mysql.yml 可单独触发，
           #     待部署稳定后删除 build-mysql.yml，mysql 仍由本流程产出。
@@ -114,7 +117,7 @@ jobs:
             BUILDX_TAGS=""
             IFS=',' read -ra _arr <<< "$TAGS"
             for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
-            docker buildx build $CACHE $CCACHE_CTX --target "$t" -f apps/docker/Dockerfile --build-arg CMODULES=static $BUILDX_TAGS --push .
+            docker buildx build $CACHE --target "$t" -f apps/docker/Dockerfile --build-arg CMODULES=static $BUILDX_TAGS --push .
           done
 
       - name: Pull & push mysql:8.4 to ghcr (ac-wotlk-mysql，部署直连免走 Docker Hub)

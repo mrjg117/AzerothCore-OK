@@ -211,13 +211,17 @@ jobs:
               echo "!! 库 $lib 为空（auto-populate 失败），部署功能不完整"; FAIL=1
             fi
           }
-          # (c) 模组独立库（动态适配新模组，无需硬编码）
-          for d in "${{ github.workspace }}/official/modules"/*/data/sql/*/; do
-            [ -d "$d" ] || continue
-            base=$(basename "$d")
-            case "$base" in world|characters|auth) continue;; esac
-            check_lib "acore_$base"
-          done
+          # (c) 模组独立库（动态适配新模组，无需硬编码）：直接查 MySQL 实际存在的 acore_ 库、排除核心三库，
+          # 空即 fail。不再靠目录名猜库——某些模组用 data/sql/db_auth、db_characters、db_world、manual
+          # 等增补目录，被误当成独立库会拼出 acore_db-auth 之类不存在的库名导致误报。
+          MOD_LIBS=$(docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'acore_%'" 2>/dev/null | grep -vE '^(acore_auth|acore_characters|acore_world)$' | tr -d '\r')
+          if [ -n "$MOD_LIBS" ]; then
+            for lib in $MOD_LIBS; do
+              check_lib "$lib"
+            done
+          else
+            echo "（无额外模组独立库，跳过）"
+          fi
           # (d) 核心三库
           for lib in acore_auth acore_characters acore_world; do
             check_lib "$lib"
