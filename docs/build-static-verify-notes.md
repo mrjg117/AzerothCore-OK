@@ -39,12 +39,14 @@ R1–R5(已在 192.168.10.99 服务端**手工**修复,但**未固化进仓库**
 - **R2**：mod-enhanced-worldchat 的 SQL 路径缺 `data/` 层 → 缺 `character_worldchat` 表。
 - **R3**：mod-playerbots 独立 `acore_playerbots` 库的基础 SQL 标准 dbimport 不导 → 缺库。
 - **R4**：base 只在首次跑 + db-import 被重复跑过 → up-to-date → 缺表永久留。
-- **R5**：mod-item-affixes 版本漂移,`mythic_plus_level` 缺 `random_affix_count` 列。
+- **R5（已确认·2026-08-28 #11）**：`mod-item-affixes` 模组 SQL **只发 `UPDATE affix_template`、不发 `CREATE TABLE`**,而 Playerbot 分支世界库无 `affix_template` 表 → db-import 在 world DB 导入阶段 `ERROR 1146 (42S02) Table 'acore_world.affix_template' doesn't exist` 必挂。全仓库(路径+内容)搜不到任何建表语句,属**模组自身 SQL 残缺/不兼容**(假设表已由别处建好,实际没有)。修复:从 `config/modules.txt` **剔除该模组**(不改官方流程);若要保留需上游补建表 SQL 或项目侧 build-patch 加 `CREATE TABLE`,但 schema 未知、C++ 可能还依赖更多列,风险高,先剔除。
 - **worldserver 侧**：全量 grep 致命错误（`ABORT / Could not prepare / Table ... doesn't exist / Unknown column / Segmentation / SIGSEGV / FATAL / panic / refused to start / cannot (load|open) / failed to initialize` 等）。**不早退、不 break、循环扫全日志**；容器 running 只是前提，**必须日志无致命错误才判成功**（running 但内部崩不算过）。不强制 "WORLD Initialized" 关键字,避免误判。
 - **关键**：deploy 验证步 `if: success()` 且**累计 FAIL、最后统一判定**,保证所有错误一次列全。
 - **R6（2026-08-28 暴露的设计坑）**：`docker compose up -d` 因依赖服务（db-import）退出非零会返回非 0，若 step 9 用 `set -e` 会整步 abort，导致 step 10（抓容器日志、扫描致命错误）被 `if: success()` 跳过——**db-import 内部真正的 SQL 报错看不到**。修复：step 9 用 `docker compose up -d --no-build || echo ...` 接住非零返回、不让整步 aborted；step 10 **去掉 `if: success()` 始终执行**，先 `docker inspect` 取 `ac-db-import` 真实 exit code + `cat` 打印其**完整日志** + 宽 grep 错误关键字，db-import 失败即立即判停（worldserver 依赖它不会起、不必空等）；仅 db-import 干净才继续 worldserver 检查。这样部署错真正全暴露。
 
 - **R7（2026-08-28 暴露的官方 bind-mount 权限坑）**：`ac-db-import`/`worldserver`/`authserver` 把 host 的 `./env/dist/etc` + `./env/dist/logs` **bind 挂载**进容器，容器以 `acore`(uid 1000, Dockerfile `USER $DOCKER_USER` 默认 acore)跑。CI 里 Docker 守护进程是 root，自动创建的 bind 目录是 **root 所有** → acore 写不进 → 官方 entrypoint `cp -rnv` 失败(`set -e`)→ 容器 exit 1。这**不是我们引入的**，是官方 Docker 已知坑（官方 entrypoint 警告原文即写 `sudo chown -R 1000:1000 ./env/dist/etc ./env/dist/logs` 或 `DOCKER_USER=root`）。官方本地流能跑是因为用户自己 chown 过 host 目录。修复（纯项目侧 CI 步骤，不改任何官方文件）：在 `docker compose up` 前 `mkdir -p env/dist/etc env/dist/logs && chown -R 1000:1000 env/dist`(runner 非 root 时用 `sudo`)，复刻官方本地前置条件。注意 compose 无 `user:` 字段、`DOCKER_USER` 仅是 build arg，故 `DOCKER_USER=root` 在 `--no-build` 的 `up` 下不生效——必须用 chown 方案。
+
+- **R8（2026-08-28 #11 后开启编译缓存）**：GitHub 托管 runner 是一次性 VM，本地 Docker 层缓存不跨运行保留 → 每次 `docker compose build` 冷启动全重编(~77 分钟)。开启方案：项目侧新增 `docker-compose.override.yml`(仅给 5 个 build 服务加 `build.cache_from/to: type=gha`,不改任何官方文件),CI 在 `docker compose build` 前 `cp` 进 `official/` 自动合并。GHA 缓存(`type=gha`)在构建过程中逐层导出,**部分成功也存**(中途失败的前序层保留),且**内容寻址**——模组/源码变了对应层自动 miss 重编,不掩盖编译/部署错误。首次带缓存的本次仍全编(冷缓存)但会存层供下次复用;要强刷整段缓存改 override 里的 cache key 前缀或 GitHub UI(Settings→Actions→Caches)删条目。
 
 ## 4.5 冻库(方案B)与用户机部署
 - **冻库方式 = 方案B(冷拷数据目录)**：部署门干净后,`docker compose stop ac-database` 优雅停库 → `docker cp` 拷出 `/var/lib/mysql` 整个目录 → `tar -I zstd` 压成 `ac-db-data.tar.zst` → 并进大包。

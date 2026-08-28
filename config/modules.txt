@@ -40,7 +40,7 @@ https://github.com/silviu20092/mod-dynamic-gathering-speed.git
 https://github.com/CDBrodie/mod-enhanced-worldchat.git
 https://github.com/Old-Man-Warcraft/mod-guild-levels.git
 https://github.com/Nevaden/mod-instant-swing.git
-https://github.com/Nevaden/mod-item-affixes.git
+# https://github.com/Nevaden/mod-item-affixes.git  # 剔除：模组 SQL 只发 UPDATE affix_template、不发建表语句，Playerbot 分支世界库无此表 -> db-import 必挂(ERROR 1146)。模组自身残缺，非流程问题。
 https://github.com/TrisBits/mod-junk-to-gold-plus.git
 https://github.com/KingDown-Assoc/mod-living-bomb.git
 https://github.com/azerothcore/mod-low-level-rbg.git

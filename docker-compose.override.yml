@@ -1,0 +1,34 @@
+# 项目侧 compose override：仅给各 build 服务加 GitHub Actions 缓存（type=gha）。
+# 不改任何官方文件；由 CI 在 `docker compose build` 前 cp 进 official/ 目录自动合并。
+# 效果：编译层存入 GHA 缓存，后续同内容构建命中缓存；模组/源码变了对应层自动 miss 重编（内容寻址，不掩盖错误）。
+services:
+  ac-db-import:
+    build:
+      cache_from:
+        - type=gha
+      cache_to:
+        - type=gha,mode=max
+  ac-worldserver:
+    build:
+      cache_from:
+        - type=gha
+      cache_to:
+        - type=gha,mode=max
+  ac-authserver:
+    build:
+      cache_from:
+        - type=gha
+      cache_to:
+        - type=gha,mode=max
+  ac-tools:
+    build:
+      cache_from:
+        - type=gha
+      cache_to:
+        - type=gha,mode=max
+  ac-client-data-init:
+    build:
+      cache_from:
+        - type=gha
+      cache_to:
+        - type=gha,mode=max
