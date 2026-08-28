@@ -21,14 +21,15 @@
 # SQL 内容随 JSON 变化而变；db-import 的 UpdateFetcher 用 SHA1 哈希比对，内容变即重灌（持久化 DB 场景）。
 #
 # 约定：workflow 已 cd 进 official/modules/mod-item-affixes 后执行本脚本（cwd = 模组根）。
+# 本脚本**不切换目录**，所有相对路径（scripts/、data/sql/db-world）都相对模组根解析。
+# （早版误用 $0 推导并 cd 进项目侧目录，导致 scripts/ 找不到——已修正。）
 
 set -euo pipefail
 
-# 模组根（不依赖调用方 cwd，按脚本自身位置推导）
-MODROOT="$(cd "$(dirname "$0")" && pwd)"
-cd "$MODROOT"
+# 仅记录脚本自身位置（项目侧 build-patches/mod-item-affixes/），不 cd 进去，以免丢失 workflow 给的模组 cwd。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "== mod-item-affixes build-patch (MODROOT=$MODROOT) =="
+echo "== mod-item-affixes build-patch (cwd=$(pwd); script=$SCRIPT_DIR) =="
 
 # 0) 定位 pwsh（GitHub-hosted ubuntu runner 预装 pwsh 7）
 if command -v pwsh >/dev/null 2>&1; then
