@@ -29,10 +29,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # ccache 跨 run 持久化：官方 Dockerfile 用 `RUN --mount=type=cache,target=/ccache`（BuildKit
+      # 匿名缓存），全新 runner 上每次 run 都丢失 -> 2159 个 .o 全量重编。core build-patch 已把该挂载
+      # 改为 `type=bind,from=ccache`，由本步骤的 actions/cache 把 /home/runner/.cache/ccache 持久化，
+      # 并注入为 build-context，实现 ccache 跨 run 复用（编译层仍走下方 gha 层缓存）。
+      - name: Cache ccache (跨 run 持久化)
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: |
+            ccache-
+
       # 构建缓存改用 buildx 原生 GHA 缓存（--cache-from/to=type=gha）。
-      # 说明：原 actions/cache + type=local 方案无法导出官方 Dockerfile 的 RUN --mount ccache
-      # 挂载内容（且 GitHub runner 为全新 VM，挂载卷本就不跨 run 存活），实际不生效；
-      # 常规无源码改动的重 build 靠 buildx 层缓存已很快，gha 缓存为 CI 最佳实践。
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -92,9 +101,11 @@ jobs:
 
       - name: Build & push 4 official server targets (ghcr.io)
         run: |
+          mkdir -p /home/runner/.cache/ccache
           cd official
           VERSION="$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)"
           CACHE="--cache-from=type=gha --cache-to=type=gha,mode=max"
+          CCACHE_CTX="--build-context ccache=/home/runner/.cache/ccache"
           # 注：client-data target 由 build-maps.yml 的 ac-maps 镜像取代。
           #     mysql 镜像在本流程一并打包推送（ac-wotlk-mysql）；临时 build-mysql.yml 可单独触发，
           #     待部署稳定后删除 build-mysql.yml，mysql 仍由本流程产出。
@@ -103,7 +114,7 @@ jobs:
             BUILDX_TAGS=""
             IFS=',' read -ra _arr <<< "$TAGS"
             for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
-            docker buildx build $CACHE --target "$t" -f apps/docker/Dockerfile --build-arg CMODULES=static $BUILDX_TAGS --push .
+            docker buildx build $CACHE $CCACHE_CTX --target "$t" -f apps/docker/Dockerfile --build-arg CMODULES=static $BUILDX_TAGS --push .
           done
 
       - name: Pull & push mysql:8.4 to ghcr (ac-wotlk-mysql，部署直连免走 Docker Hub)

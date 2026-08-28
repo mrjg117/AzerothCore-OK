@@ -1,6 +1,9 @@
-# 项目侧 compose override：仅给各 build 服务加 GitHub Actions 缓存（type=gha）。
+# 项目侧 compose override：仅给各 build 服务加 GitHub Actions 缓存（type=gha）+ ccache 持久化。
 # 不改任何官方文件；由 CI 在 `docker compose build` 前 cp 进 official/ 目录自动合并。
-# 效果：编译层存入 GHA 缓存，后续同内容构建命中缓存；模组/源码变了对应层自动 miss 重编（内容寻址，不掩盖错误）。
+# - cache_from/to: type=gha：编译层存入 GHA 缓存，同内容构建命中缓存；模组/源码变了对应层自动 miss 重编。
+# - additional_contexts.ccache：把 ccache 目录（由 CI 的 actions/cache 跨 run 持久化）注入为 build-context，
+#   供 core build-patch 改后的 Dockerfile `RUN --mount=type=bind,from=ccache` 使用，实现 ccache 跨 run 复用。
+# 注：/home/runner/.cache/ccache 是 GitHub Actions runner 路径；本地若套用本 override 需自行改为此路径或先建目录。
 services:
   ac-db-import:
     build:
@@ -8,27 +11,37 @@ services:
         - type=gha
       cache_to:
         - type=gha,mode=max
+      additional_contexts:
+        ccache: /home/runner/.cache/ccache
   ac-worldserver:
     build:
       cache_from:
         - type=gha
       cache_to:
         - type=gha,mode=max
+      additional_contexts:
+        ccache: /home/runner/.cache/ccache
   ac-authserver:
     build:
       cache_from:
         - type=gha
       cache_to:
         - type=gha,mode=max
+      additional_contexts:
+        ccache: /home/runner/.cache/ccache
   ac-tools:
     build:
       cache_from:
         - type=gha
       cache_to:
         - type=gha,mode=max
+      additional_contexts:
+        ccache: /home/runner/.cache/ccache
   ac-client-data-init:
     build:
       cache_from:
         - type=gha
       cache_to:
         - type=gha,mode=max
+      additional_contexts:
+        ccache: /home/runner/.cache/ccache
