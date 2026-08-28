@@ -201,7 +201,7 @@ jobs:
             docker compose ps ac-database --status running -q >/dev/null 2>&1 || { echo "db stopped"; break; }
             sleep 2
           done
-          CID=$(docker compose ps -q ac-database)
+          CID=$(docker compose ps -q --all ac-database)
           echo "db container id=$CID"
           mkdir -p /tmp/dbdata
           docker cp "$CID:/var/lib/mysql/." /tmp/dbdata/
