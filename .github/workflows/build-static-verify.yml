@@ -188,19 +188,40 @@ jobs:
           if grep -Eqi 'ABORT|Could not prepare|Table .* doesn.t exist|Unknown column|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize' /tmp/ws.log; then
             echo "!! worldserver 暴露致命错误"; FAIL=1
           fi
-          # ---- playerbots 功能完整性（库必须真正建表，bot 系统才可用）----
-          # 官方 Docker 依赖运行时容器能找到 modules/.../data/sql 才能 auto-populate acore_playerbots；
-          # 烘焙镜像若不带 modules，worldserver 会打 "Directory .../data/sql/playerbots/base/ not exist"
-          # 且不退出（exit 0），导致库空、.playerbots / co / initself / self 全失效。这里确定性查库
-          # + 日志铁证兜底：库为空即判停，杜绝“构建绿但功能缺”的分发。
-          PB_TABLES=0
-          if docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='acore_playerbots'" >/tmp/pb.log 2>&1; then
-            PB_TABLES=$(grep -Eo '[0-9]+' /tmp/pb.log | head -1)
+          # ---- 通用功能完整性 gate（所有模组/核心，不限于 playerbots）----
+          # 任何模组 auto-populate 失败都会让 worldserver 打 error 但不退出（exit 0），导致“构建绿但功能缺”。
+          # 这里统一暴露并在最后一步判停：
+          # (a) 任意模组 data/sql base 目录缺失的铁证（auto-populate 找不到 SQL）
+          # (b) DB 结构与核心/模组版本未对齐（updates 未应用，全库通用致命信号）
+          # (c) 动态验证所有模组独立库（扫 modules/*/data/sql/ 下非 world/characters/auth 子目录 -> acore_<子目录>）
+          # (d) 核心三库 auth/characters/world 必非空
+          if grep -Eqi 'Directory .*/data/sql/.*/base/ not exist' /tmp/ws.log; then
+            echo "!! worldserver 日志检测到某模组 data/sql base 目录缺失（auto-populate 失败），部署功能不完整"; FAIL=1
           fi
-          echo "acore_playerbots tables = ${PB_TABLES:-0}"
-          if [ "${PB_TABLES:-0}" -eq 0 ] || grep -Eqi 'Directory .*mod-playerbots/data/sql/playerbots/base/ not exist' /tmp/ws.log; then
-            echo "!! acore_playerbots 库为空或未初始化（bot 系统不可用），部署功能不完整，停（不冻库不打包）"; FAIL=1
+          if grep -Eqi 'Your database structure is not up to date|Please make sure you.ve executed all queries in the sql/updates folders' /tmp/ws.log; then
+            echo "!! DB 结构与核心/模组版本未对齐（updates 未应用），部署功能不完整"; FAIL=1
           fi
+          check_lib() {
+            local lib="$1"; local T=0
+            if docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$lib'" >/tmp/lib.log 2>&1; then
+              T=$(grep -Eo '[0-9]+' /tmp/lib.log | head -1)
+            fi
+            echo "$lib tables = ${T:-0}"
+            if [ "${T:-0}" -eq 0 ]; then
+              echo "!! 库 $lib 为空（auto-populate 失败），部署功能不完整"; FAIL=1
+            fi
+          }
+          # (c) 模组独立库（动态适配新模组，无需硬编码）
+          for d in "${{ github.workspace }}/official/modules"/*/data/sql/*/; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")
+            case "$base" in world|characters|auth) continue;; esac
+            check_lib "acore_$base"
+          done
+          # (d) 核心三库
+          for lib in acore_auth acore_characters acore_world; do
+            check_lib "$lib"
+          done
           if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误，停（不冻库不打包）"; exit 1; fi
           echo "部署无错误（db-import 完成 + worldserver 运行中且无致命错误）"
 
