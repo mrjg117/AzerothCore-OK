@@ -1,22 +1,21 @@
 name: build-static-verify
 
 # 纯官方流程搬到云：把你在本地跑官方 Playerbot 部署那套，原样在 Actions 上跑一遍。
-# 唯一叠加：暴露错误(grep 部署日志) + 全干净才冻库打包分发。完全不破坏官方逻辑。
+# 唯一叠加：尽量多暴露错误 + 全干净才冻库打包分发。完全不破坏官方逻辑。
 #
 # 官方 = mod-playerbots/azerothcore-wotlk @Playerbot 的 docker-compose.yml + Dockerfile
 #   - Dockerfile 第 51 行 ARG CMODULES="static" → 官方本就 static，不覆盖、不传参。
 #   - 挂载 AzerothCore-OK 的 config/modules.txt 模组 + build-patches/ 补丁（项目侧输入，官方流程之上的必要内容）。
 #   - 不碰 ghcr：分发靠 tarball 大包（docker save 本地镜像 + 冻库 + 配置 + 地图），不靠 registry。
 #
-# 流程（单 job，镜像本地复用，不跨 job 搬）：
-#   1) Clone 官方核心 @Playerbot
-#   2) 挂 40 模组 + apply build-patches            （项目输入）
-#   3) 准备 etc 配置（叠仓库模组 conf，核心 conf 用官方默认）
-  #   4) docker compose --profile tools build         （官方编译；跑完暴露全部错误，有错才停在打包前）
-  #   5) docker compose up -d --no-build              （官方部署；跑完暴露全部错误，有错才停在打包前）
-#   6) grep 暴露 db-import / worldserver 错误        （收全错误，不早退）
-#   7) 全干净才冻库（停 mysql→拷数据目录→压）+ 打包（5 镜像 + etc + 冻库 + 地图 ac-maps-latest.tar.zst，同工作流内 Package map data 步）→ 上传
-#   任一步失败 → 后续不跑（不冻库不打包），日志全暴露。
+# 【全链路监控原则（用户铁律）】
+#   尽量多的暴露。除「彻底进行不下去」外，所有环节一律跑完、收集全部错误，不中途停。
+#   唯一硬停在「打包前」那道 Gate：汇总到的任何错误 → 不冻库不打包，停下来改。
+#   - 缓存(3/4) 属可恢复，best-effort，绝不致命。
+#   - Clone 核心(5) 是唯一的「彻底进行不下去」例外（无源码后续全无意义），保留硬停、且秒级失败不空转。
+#   - 其余所有环节(1–11) 一律 set +e 跑完、错误追加进 /tmp/ci_errors.log、打印全量，step 本体 exit 0（不红、不挡后续）。
+#   - Gate 步（打包前）读 /tmp/ci_errors.log：非空 → 打印全部错误并 exit 1（停，不打包）；空 → 进打包。
+#   - 每个环节内部也贯彻「暴露全部」：模组/补丁逐个全量 apply，单个失败记下来继续，不 abort 后续补丁。
 
 on:
   workflow_dispatch:
@@ -49,7 +48,9 @@ jobs:
         uses: docker/setup-buildx-action@v3
         id: setup-buildx
 
-      - name: Cache ccache (跨 run 持久化)
+      # 缓存 = 可恢复，best-effort，绝不致命。缺失只是少缓存、顶多慢，不该挡构建。
+      - name: Cache ccache (跨 run 持久化; 可恢复, 失败不致命)
+        continue-on-error: true
         uses: actions/cache@v4
         id: cache-ccache
         with:
@@ -58,7 +59,8 @@ jobs:
           restore-keys: |
             ccache-
 
-      - name: Restore ccache cache mount (buildkit-cache-dance)
+      - name: Restore ccache cache mount (buildkit-cache-dance; 可恢复, 失败不致命)
+        continue-on-error: true
         uses: reproducible-containers/buildkit-cache-dance@v3
         with:
           builder: ${{ steps.setup-buildx.outputs.name }}
@@ -68,6 +70,7 @@ jobs:
             }
           skip-extraction: ${{ steps.cache-ccache.outputs.cache-hit }}
 
+      # 唯一「彻底进行不下去」例外：无官方核心源码，后续全无意义。保留硬停 + 秒级失败。
       - name: Clone official Playerbot core @ ${{ env.ACORE_REF }}
         run: |
           set -e
@@ -77,67 +80,105 @@ jobs:
           git checkout "$ACORE_REF"
           echo "== cloned official core @ $ACORE_REF =="
 
-      - name: Mount modules (config/modules.txt) + apply build-patches
+      # 全量 apply：模组逐个 clone、补丁逐个贴，单个失败记下来继续，不 abort 后续补丁。
+      - name: Mount modules (config/modules.txt) + apply build-patches (全量暴露)
         run: |
-          set -e
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           cd official
-          # 挂模组：读项目 config/modules.txt，逐个 clone 进 modules/（去 -master 后缀）
+          # 挂模组：读项目 config/modules.txt，逐个 clone 进 modules/（去 -master 后缀）；单个失败记下来继续
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             case "$url" in \#*) continue;; esac
             name=$(basename "$url" .git); name=${name%-master}
             echo "-> $url => modules/$name"
-            git clone --depth 1 "$url" "modules/$name"
+            if git clone --depth 1 "$url" "modules/$name" 2>/tmp/clone.log; then
+              : ok
+            else
+              rec "MODULE CLONE FAIL: $url"; echo "---- clone error ----"; tail -n 20 /tmp/clone.log
+            fi
           done < ../project/config/modules.txt
-          # apply 核心/模组 build-patches（项目侧补丁，官方流程之上的输入）
+          # apply 核心/模组 build-patches（项目侧补丁，官方流程之上的输入）；全部试一遍，失败记全
           BP="${{ github.workspace }}/project/build-patches"
           for moddir in "$BP"/*/; do
             [ -d "$moddir" ] || continue
             name=$(basename "$moddir")
             if [ "$name" = "core" ]; then tgt="$PWD"; else tgt="$PWD/modules/$name"; fi
-            [ -d "$tgt" ] || { echo "!! target $tgt not found, skip $name"; continue; }
+            [ -d "$tgt" ] || { rec "PATCH TARGET MISSING: $name -> $tgt (模组未 clone 成功)"; continue; }
             echo "== build-patches: $name -> $tgt =="
             for p in $(ls "$moddir"*.patch 2>/dev/null | sort); do
-              echo "  git-apply: $(basename "$p")"
-              ( cd "$tgt" && git apply --3way --whitespace=nowarn "$p" ) || ( cd "$tgt" && patch -p1 --fuzz=5 < "$p" )
+              echo "  patch: $(basename "$p")"
+              if ( cd "$tgt" && git apply --3way --whitespace=nowarn "$p" ) 2>/tmp/pa.log; then
+                : ok
+              elif ( cd "$tgt" && patch -p1 --fuzz=5 < "$p" ) 2>/tmp/pa.log; then
+                : ok
+              else
+                rec "PATCH FAIL: $name / $(basename "$p")"; echo "---- patch error ----"; tail -n 25 /tmp/pa.log
+              fi
             done
             for s in $(ls "$moddir"*.sh 2>/dev/null | sort); do
               echo "  shell: $(basename "$s")"
-              ( cd "$tgt" && bash "$s" )
+              if ( cd "$tgt" && bash "$s" ) 2>/tmp/sh.log; then
+                : ok
+              else
+                rec "SHELL FAIL: $name / $(basename "$s")"; echo "---- shell error ----"; tail -n 25 /tmp/sh.log
+              fi
             done
             if [ -d "$moddir/overlay" ]; then
               echo "  overlay: copy $moddir/overlay -> $tgt"
-              cp -r "$moddir/overlay/." "$tgt/"
+              if cp -r "$moddir/overlay/." "$tgt/" 2>/tmp/ov.log; then
+                : ok
+              else
+                rec "OVERLAY FAIL: $name"; echo "---- overlay error ----"; tail -n 25 /tmp/ov.log
+              fi
             fi
           done
-          echo "modules mounted + patches applied"
+          echo "== modules mounted + patches applied (错误见上方 [ERR] 与 Gate 汇总) =="
 
-      - name: Prepare etc config (叠仓库模组 conf；核心 conf 用官方默认)
+      # 准备 etc 配置（叠仓库模组 conf，核心 conf 用官方默认）；某个 conf 拷失败也记下来继续，不中途停。
+      - name: Prepare etc config (叠仓库模组 conf; 全量暴露)
         run: |
-          set -e
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           ETC="${{ github.workspace }}/official/env/dist/etc"
           mkdir -p "$ETC"
           # 仅叠加模组 conf；核心 worldserver.conf/authserver.conf 用官方镜像默认（entrypoint 自动复制），不覆盖以免破坏 DB 连接等默认设置
           for f in $(find "${{ github.workspace }}/project/config/extra-config/confs" -type f -name '*.conf'); do
             b=$(basename "$f")
             case "$b" in worldserver.conf|authserver.conf) continue;; esac
-            cp "$f" "$ETC/$b"
+            if cp "$f" "$ETC/$b" 2>/tmp/cp.log; then
+              echo "copied $b"
+            else
+              rec "ETC COPY FAIL: $b"; echo "---- cp error ----"; tail -n 15 /tmp/cp.log
+            fi
           done
-          echo "== prepared etc =="; ls -1 "$ETC"
+          echo "== prepared etc =="; ls -1 "$ETC" 2>/dev/null
 
-      - name: Write CI .env (占位值，仅验部署链路；密码按官方变量名 DOCKER_DB_ROOT_PASSWORD)
+      # 写 CI 临时 .env（占位值，仅验部署链路；密码按官方变量名 DOCKER_DB_ROOT_PASSWORD）；写失败记下来继续。
+      - name: Write CI .env (占位值, 仅验部署链路)
         run: |
-          set -e
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           cd "${{ github.workspace }}/official"
-          printf 'DOCKER_DB_ROOT_PASSWORD=ci-test\nSOAP_LOGIN=ci-test\nSOAP_PASSWORD=ci-test\n' > .env
-          echo "== .env written =="; cat .env
+          if printf 'DOCKER_DB_ROOT_PASSWORD=ci-test\nSOAP_LOGIN=ci-test\nSOAP_PASSWORD=ci-test\n' > .env 2>/tmp/env.log; then
+            echo "== .env written =="; cat .env
+          else
+            rec "ENV WRITE FAIL"; tail -n 15 /tmp/env.log
+          fi
 
       # 地图完全交给官方流程：Bring up 阶段 ac-client-data-init 服务跑官方 client-data 镜像
       # (CMD=inst_download_client_data)，从官方 GitHub release 拉真实地图灌进 ac-client-data 卷。不自造下载。
 
-      - name: Build core images (官方编译 + core补丁加-k 暴露全部错误；有错停在打包前)
+      # 编译：core build-patch 已给 cmake --build 加 -- -k 0（Ninja 无限继续），暴露全部模组编译错；
+      # 退出码非零记错误，并额外扫编译日志红标暴露。step 本体 exit 0，不挡后续（Gate 汇总停打包）。
+      - name: Build core images (官方编译 + -k 0 暴露全部编译错; 全量暴露)
         run: |
-          set -e
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           cd "${{ github.workspace }}/official"
           mkdir -p /home/runner/.cache/ccache
           # 缓存：docker-compose.override.yml 给各 build 服务加 build.cache_from/to: type=gha（编译层缓存）。
@@ -149,12 +190,23 @@ jobs:
           cp "${{ github.workspace }}/project/docker-compose.override.yml" ./docker-compose.override.yml
           # 官方 CMODULES 默认 static（Dockerfile ARG），不覆盖。core build-patch(keep_going.sh) 已给 cmake --build 加 -- -k 0（官方用 Ninja 生成器，-k 必须带数字 0=无限继续），遇错继续编译、暴露全部模组错误。
           # --profile tools 放 docker compose 全局位（compose v2 的 --profile 是全局 flag，不能放 build 子命令后），一并编 tools 进大包。
-          # 注：官方 cmake --build 本不带 -k（单服务内编译错只报第一个）；经 core build-patch 已加 -- -k 0 透传 ninja，现可暴露全部模组编译错误；有错 ninja 返回非0 -> step 非零退 -> 后续 if:success 不跑 -> 不打包。
-          docker compose --profile tools build
-          echo "== build done =="
+          ESC=$(printf '\033'); RED_RE="${ESC}\[[0-9;]*31m"
+          docker compose --profile tools build > /tmp/build.log 2>&1
+          BRC=$?
+          echo "== build 退出码 = $BRC =="
+          if [ "$BRC" != "0" ]; then rec "BUILD: docker compose build 返回非零($BRC)"; fi
+          echo "== 编译日志红标扫描（前 40 行，额外暴露，非致命判定） =="
+          grep -Ea "$RED_RE" /tmp/build.log | cat -v | sed 's/\^\[\[[0-9;]*m//g' | head -40 || true
+          echo "== build.log 尾部（便于定位首个编译错） =="
+          tail -n 40 /tmp/build.log | sed 's/\^\[\[[0-9;]*m//g' || true
+          echo "== build done (错误见 [ERR] 与 Gate 汇总) =="
 
-      - name: Bring up stack (官方部署：官方 ac-client-data-init 拉地图灌卷)
+      # 拉起整套服务：官方部署。compose up 返回非零（某服务未正常起）吸掉，交 Verify 抓日志。不硬停。
+      - name: Bring up stack (官方部署：官方 ac-client-data-init 拉地图灌卷; 全量暴露)
         run: |
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           cd "${{ github.workspace }}/official"
           # 官方部署：docker compose up -d 依次起
           #   ac-database(mysql, healthcheck) ->
@@ -163,17 +215,23 @@ jobs:
           #   ac-worldserver(depends_on 三条件全满足才起，挂同一卷读 maps) + ac-authserver。
           # 地图完全由官方流程负责，不自造下载、不关 init、不改卷名。
           # 官方 bind-mount 权限坑（官方 entrypoint 警告明写）：CI 里 Docker 守护是 root，自动建的 ./env/dist/etc|logs 是 root 所有，
-          #   容器以 acore(uid1000) 跑 -> entrypoint cp 失败(set -e) -> exit1。复刻官方本地前置：预建目录并交给 uid1000。
+          #   容器以 acore(uid1000) 跑 -> entrypoint cp 失败 -> exit1。复刻官方本地前置：预建目录并交给 uid1000。
           mkdir -p env/dist/etc env/dist/logs
           chown -R 1000:1000 env/dist 2>/dev/null || sudo chown -R 1000:1000 env/dist
           # 用刚编好的本地镜像起栈；官方 client-data/init 镜像由 compose 按 image: 拉取并运行(inst_download_client_data 灌地图)。
-          # db-import/worldserver 任一退出非零，compose up 会返回非0；用 || 接住交下一步抓日志。
-          docker compose up -d || echo "!! docker compose up 返回非零（有服务未正常起/退出），交下一步抓日志"
+          docker compose up -d
+          URC=$?
+          echo "== docker compose up -d 退出码 = $URC =="
+          if [ "$URC" != "0" ]; then rec "BRING-UP: docker compose up -d 返回非零($URC)（有服务未正常起/退出，Verify 会抓日志）"; fi
           docker compose ps
 
-      - name: Verify deployment (官方流程成功判据：worldserver ready + 地图非空 + authserver up + db-import exit0 + 各库非空)
+      # Verify：收集全部部署错误进 /tmp/ci_errors.log 并打印，step 本体 exit 0（不红、不挡）。
+      # 轮询只等「完成信号」(ready/exited)，错误检测在末尾全量扫（累积流，非 tail 截断）。致命判据只在 Gate 汇总停打包。
+      - name: Verify deployment (收集全部部署错误; 全量暴露)
         run: |
-          set -e
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           cd "${{ github.workspace }}/official"
           set -a; [ -f .env ] && . ./.env; set +a
           FAIL=0
@@ -187,7 +245,7 @@ jobs:
           if [ -n "$DB_CID" ]; then
             DB_ST=$(docker inspect -f '{{.State.Status}}' "$DB_CID" 2>/dev/null)
             DB_EC=$(docker inspect -f '{{.State.ExitCode}}' "$DB_CID" 2>/dev/null)
-            if [ "$DB_ST" = "exited" ] && [ "${DB_EC:-0}" != "0" ]; then echo "!! ac-database 崩溃退出($DB_EC)"; FAIL=1; fi
+            if [ "$DB_ST" = "exited" ] && [ "${DB_EC:-0}" != "0" ]; then echo "!! ac-database 崩溃退出($DB_EC)"; rec "VERIFY: ac-database 崩溃退出($DB_EC)"; FAIL=1; fi
           fi
 
           # ===== 1) db-import（一次性任务：exit 非0 即失败）=====
@@ -195,7 +253,7 @@ jobs:
           echo "==== db-import log (FULL) ===="; cat -v /tmp/dbimport.log | sed 's/\^\[\[[0-9;]*m//g' | tail -n 60
           DI_RC=$(docker inspect -f '{{.State.ExitCode}}' ac-db-import 2>/dev/null || echo "NA")
           echo "ac-db-import exit code = $DI_RC"
-          if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then echo "!! ac-db-import 异常退出($DI_RC)"; FAIL=1; fi
+          if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then echo "!! ac-db-import 异常退出($DI_RC)"; rec "VERIFY: ac-db-import 异常退出($DI_RC)"; FAIL=1; fi
 
           # ===== 2) worldserver：轮询只等"完成信号"(ready / exited)，不当错误探测器 =====
           WS_READY=0; WS_EXITED=0; WS_CODE=0
@@ -217,24 +275,23 @@ jobs:
           if [ -n "$CID" ]; then
             ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
             EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
-            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! worldserver 崩溃退出(code=$EC)"; FAIL=1; fi
+            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! worldserver 崩溃退出(code=$EC)"; rec "VERIFY: worldserver 崩溃退出(code=$EC)"; FAIL=1; fi
           fi
-          if [ "$WS_READY" != "1" ] && [ "$WS_EXITED" != "1" ]; then echo "!! worldserver 超时未 ready 也未崩溃（起不来，判 FAIL）"; FAIL=1; fi
+          if [ "$WS_READY" != "1" ] && [ "$WS_EXITED" != "1" ]; then echo "!! worldserver 超时未 ready 也未崩溃（起不来）"; rec "VERIFY: worldserver 超时未 ready 也未崩溃"; FAIL=1; fi
 
           # ===== 2b) 地图落地硬校验：官方 ac-client-data-init 灌的卷内 maps/dbc/vmaps/mmaps/Cameras 必须非空 =====
-          # 这一道保证「拿下来就一定能跑」：卷空/灌失败在这里直接 FAIL，绝不带着无地图的包过关。
           WS_CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
           if [ -n "$WS_CID" ]; then
             for d in maps dbc vmaps mmaps Cameras; do
               c=$(docker compose exec -T ac-worldserver sh -c "ls /azerothcore/env/dist/data/$d 2>/dev/null | wc -l" 2>/dev/null)
               echo "worldserver data/$d files = ${c:-0}"
-              [ "${c:-0}" -gt 0 ] || { echo "!! worldserver 内 data/$d 为空（官方地图未灌入，拿下来跑不起来）"; FAIL=1; }
+              if [ "${c:-0}" -eq 0 ]; then echo "!! worldserver 内 data/$d 为空（官方地图未灌入，拿下来跑不起来）"; rec "VERIFY: worldserver data/$d 为空（官方地图未灌入）"; FAIL=1; fi
             done
           else
             echo "（worldserver 已退出，跳过容器内地图校验；上方崩溃检查已捕获）"
           fi
 
-          # ===== 3) authserver：同理 =====
+          # ===== 3) authserver：同理。就绪信号 = 官方实际打印的 'Added realm "..." at IP:PORT.' =====
           AS_READY=0; AS_EXITED=0; AS_CODE=0
           for i in $(seq 1 30); do
             CID=$(docker compose ps -q ac-authserver 2>/dev/null)
@@ -244,7 +301,7 @@ jobs:
               if [ "$ST" = "exited" ]; then AS_EXITED=1; AS_CODE=$EC; break; fi
             fi
             docker compose logs ac-authserver 2>/dev/null > /tmp/as.log || true
-            if grep -Eqi 'Authserver is ready|accepting connections' /tmp/as.log; then AS_READY=1; break; fi
+            if grep -Eqi 'Added realm|authserver .* is (now )?ready|started auth' /tmp/as.log; then AS_READY=1; break; fi
             sleep 5
           done
           docker compose logs ac-authserver 2>/dev/null > /tmp/as.log || true
@@ -253,9 +310,9 @@ jobs:
           if [ -n "$CID" ]; then
             ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
             EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
-            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! authserver 崩溃退出(code=$EC)"; FAIL=1; fi
+            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! authserver 崩溃退出(code=$EC)"; rec "VERIFY: authserver 崩溃退出(code=$EC)"; FAIL=1; fi
           fi
-          if [ "$AS_READY" != "1" ] && [ "$AS_EXITED" != "1" ]; then echo "!! authserver 超时未 ready 也未崩溃"; FAIL=1; fi
+          if [ "$AS_READY" != "1" ] && [ "$AS_EXITED" != "1" ]; then echo "!! authserver 超时未 ready 也未崩溃"; rec "VERIFY: authserver 超时未 ready 也未崩溃"; FAIL=1; fi
 
           # ===== 4) 库非空（auto-populate 失败才空）=====
           check_lib() {
@@ -264,13 +321,13 @@ jobs:
               T=$(grep -Eo '[0-9]+' /tmp/lib.log | head -1)
             fi
             echo "$lib tables = ${T:-0}"
-            if [ "${T:-0}" -eq 0 ]; then echo "!! 库 $lib 为空（auto-populate 失败）"; FAIL=1; fi
+            if [ "${T:-0}" -eq 0 ]; then echo "!! 库 $lib 为空（auto-populate 失败）"; rec "VERIFY: 库 $lib 为空（auto-populate 失败）"; FAIL=1; fi
           }
           MOD_LIBS=$(docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'acore_%'" 2>/dev/null | grep -vE '^(acore_auth|acore_characters|acore_world)$' | tr -d '\r')
           if [ -n "$MOD_LIBS" ]; then for lib in $MOD_LIBS; do check_lib "$lib"; done; else echo "（无额外模组独立库，跳过）"; fi
           for lib in acore_auth acore_characters acore_world; do check_lib "$lib"; done
           # 4b) 模组 data/sql base 目录缺失铁证（auto-populate 找不到 SQL，真失败）
-          if grep -Eqi 'Directory .*/data/sql/.*/base/ not exist' /tmp/ws.log; then echo "!! 模组 data/sql base 目录缺失（auto-populate 失败）"; FAIL=1; fi
+          if grep -Eqi 'Directory .*/data/sql/.*/base/ not exist' /tmp/ws.log; then echo "!! 模组 data/sql base 目录缺失（auto-populate 失败）"; rec "VERIFY: 模组 data/sql base 目录缺失"; FAIL=1; fi
 
           # ===== 5) 诊断输出（AC 红色行仅打印，不当致命——官方镜像自带这些非致命告警，官方自己带它们跑）=====
           echo "==== 诊断：worldserver 红色错误行（仅参考，非致命） ===="
@@ -278,8 +335,21 @@ jobs:
           echo "==== 诊断：authserver 红色错误行（仅参考，非致命） ===="
           grep -Ea "$RED_RE" /tmp/as.log | cat -v | sed 's/\^\[\[[0-9;]*m//g' | head -20 || true
 
-          if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误，停（不冻库不打包）"; exit 1; fi
-          echo "部署无错误（官方流程：db-import 完成 + worldserver ready + 地图非空 + authserver up + 各库非空）"
+          if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误（已记入 /tmp/ci_errors.log，交 Gate 步停打包）"; else echo "部署本地检查无致命错误（Gate 汇总全部环节后最终判定）"; fi
+
+      # ===== 打包前 Gate：全链路唯一硬停点 =====
+      # 读 /tmp/ci_errors.log：非空 → 打印全部错误并 exit 1（停，不冻库不打包）；空 → 进打包分发。
+      - name: Gate (打包前最终判定：有暴露错误则停, 不打包)
+        run: |
+          set -e
+          if [ -s /tmp/ci_errors.log ]; then
+            echo "!!==== 全链路暴露的错误汇总（共 $(wc -l < /tmp/ci_errors.log) 条）===="
+            cat /tmp/ci_errors.log
+            echo "!! 存在暴露的错误，停，不冻库不打包，回去改。===="
+            exit 1
+          fi
+          echo "全链路无暴露错误，进入打包分发。"
+
       - name: Freeze database (优雅停库→拷数据目录→压缩) 仅部署干净才到这
         if: success()
         run: |
