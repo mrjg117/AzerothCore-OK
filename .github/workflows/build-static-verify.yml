@@ -190,16 +190,21 @@ jobs:
           cp "${{ github.workspace }}/project/docker-compose.override.yml" ./docker-compose.override.yml
           # 官方 CMODULES 默认 static（Dockerfile ARG），不覆盖。core build-patch(keep_going.sh) 已给 cmake --build 加 -- -k 0（官方用 Ninja 生成器，-k 必须带数字 0=无限继续），遇错继续编译、暴露全部模组错误。
           # --profile tools 放 docker compose 全局位（compose v2 的 --profile 是全局 flag，不能放 build 子命令后），一并编 tools 进大包。
-          ESC=$(printf '\033'); RED_RE="${ESC}\[[0-9;]*31m"
-          docker compose --profile tools build > /tmp/build.log 2>&1
-          BRC=$?
+          BUILDKIT_PROGRESS=plain docker compose --profile tools build 2>&1 | tee /tmp/build.log
+          BRC=${PIPESTATUS[0]}
           echo "== build 退出码 = $BRC =="
           if [ "$BRC" != "0" ]; then rec "BUILD: docker compose build 返回非零($BRC)"; fi
-          echo "== 编译日志红标扫描（前 40 行，额外暴露，非致命判定） =="
-          grep -Ea "$RED_RE" /tmp/build.log | cat -v | sed 's/\^\[\[[0-9;]*m//g' | head -40 || true
-          echo "== build.log 尾部（便于定位首个编译错） =="
-          tail -n 40 /tmp/build.log | sed 's/\^\[\[[0-9;]*m//g' || true
-          echo "== build done (错误见 [ERR] 与 Gate 汇总) =="
+          echo "== 编译错误关键字扫描（error:/FAILED/undefined reference/Error） =="
+          grep -Ea 'error:|FAILED|undefined reference|Error ' /tmp/build.log | head -60 || true
+          echo "== build done (完整日志见 build-log 工件；错误见 [ERR] 与 Gate 汇总) =="
+
+      - name: Upload build log (完整编译日志; 失败也传)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: warn
 
       # 拉起整套服务：官方部署。compose up 返回非零（某服务未正常起）吸掉，交 Verify 抓日志。不硬停。
       - name: Bring up stack (官方部署：官方 ac-client-data-init 拉地图灌卷; 全量暴露)
