@@ -200,107 +200,110 @@ jobs:
           docker compose -f docker-compose.yml -f noop-init.yml up -d --no-build || echo "!! docker compose up 返回非零（有服务未正常起/退出），交下一步抓日志"
           docker compose -f docker-compose.yml -f noop-init.yml ps
 
-      - name: Expose deployment errors (db-import + worldserver；收全不早退)
+      - name: Verify deployment (universal error detection; 收全不早退)
         run: |
           set -e
           cd "${{ github.workspace }}/official"
           set -a; [ -f .env ] && . ./.env; set +a
           FAIL=0
-          MAP_PROVISIONED=true
-          # ---- db-import（一次性任务，exit 非0 即失败）----
+          # 通用错误信号：AC 自身用红色前景 [31;1m / [1;31m 标注错误（不枚举任何具体文案）。
+          # docker compose logs 在 CI 无 TTY 仍转发容器 stdout 的 ANSI 颜色码，AC 控制台输出带色。
+          ESC=$(printf '\033')
+          RED_RE="${ESC}\[[0-9;]*31m"
+
+          # ===== 0) ac-database 进程状态（崩溃即 FAIL，兜底 mysql 自启失败）=====
+          DB_CID=$(docker compose ps -q ac-database 2>/dev/null)
+          if [ -n "$DB_CID" ]; then
+            DB_ST=$(docker inspect -f '{{.State.Status}}' "$DB_CID" 2>/dev/null)
+            DB_EC=$(docker inspect -f '{{.State.ExitCode}}' "$DB_CID" 2>/dev/null)
+            if [ "$DB_ST" = "exited" ] && [ "${DB_EC:-0}" != "0" ]; then echo "!! ac-database 崩溃退出($DB_EC)"; FAIL=1; fi
+          fi
+
+          # ===== 1) db-import（一次性任务：exit 非0 即失败；日志含 AC 红色标记即错误）=====
           docker compose logs ac-db-import > /tmp/dbimport.log 2>&1 || true
-          echo "==== db-import log (FULL) ===="; cat /tmp/dbimport.log
+          echo "==== db-import log (FULL) ===="; cat -v /tmp/dbimport.log | sed 's/\^\[\[[0-9;]*m//g' | tail -n 60
           DI_RC=$(docker inspect -f '{{.State.ExitCode}}' ac-db-import 2>/dev/null || echo "NA")
           echo "ac-db-import exit code = $DI_RC"
-          if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then
-            echo "!! ac-db-import 异常退出($DI_RC)"; FAIL=1
-          fi
-          # db-import 是一次性导入任务：灌 SQL 失败会直接 exit 非0（上面 ExitCode 已判定）。
-          # 不再对日志做宽 grep——AC 首次连库会打印 "Database ... does not exist" 这类预期探测提示
-          # （随后即 "Creating database ... Done."），属正常流程，宽词会误判挡住打包分发。
-          # db-import 失败则 worldserver 依赖它不会起，直接判停（不必再空等 worldserver）
+          if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then echo "!! ac-db-import 异常退出($DI_RC)"; FAIL=1; fi
+          if grep -Ea "$RED_RE" /tmp/dbimport.log; then echo "!! ac-db-import 日志含 AC 红色错误标记"; FAIL=1; fi
           if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误（db-import），停（不冻库不打包）"; exit 1; fi
-          # ---- worldserver ----
-          WS_SEEN=0
-          for i in $(seq 1 120); do
-            docker compose ps ac-worldserver --status running -q >/dev/null 2>&1 && WS_SEEN=1 && break
-            sleep 5
-          done
-          if [ "$WS_SEEN" != "1" ]; then echo "!! worldserver 容器未运行（启动失败/崩溃）"; FAIL=1; fi
-          # 轮询直到 worldserver 真正 ready（出现就绪标记）或超时，再全量扫日志。
-          # 不再固定 sleep 60——地图/DBC 加载在配置阶段之后，固定窗口会漏掉晚期致命错误（之前空数据假绿的根因）。
-          for i in $(seq 1 60); do
+
+          # ===== 2) worldserver：轮询只等"完成信号"(ready / exited)，不当错误探测器 =====
+          WS_READY=0; WS_EXITED=0; WS_CODE=0
+          for i in $(seq 1 90); do
+            CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
+            if [ -n "$CID" ]; then
+              ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
+              EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
+              if [ "$ST" = "exited" ]; then WS_EXITED=1; WS_CODE=$EC; break; fi
+            fi
             docker compose logs ac-worldserver 2>/dev/null > /tmp/ws.log || true
-            if grep -Eqi 'azerothcore>|WorldSession|World initialized|server is (now )?accepting|Worldserver is ready' /tmp/ws.log; then break; fi
-            if grep -Eqi 'ABORT|Could not prepare|Table .* doesn.t exist|Unknown column|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize' /tmp/ws.log; then break; fi
+            if grep -Eqi 'azerothcore>|WorldSession|World initialized|server is (now )?accepting|Worldserver is ready' /tmp/ws.log; then WS_READY=1; break; fi
             sleep 10
           done
           docker compose logs ac-worldserver 2>/dev/null > /tmp/ws.log || true
-          echo "==== worldserver log (full scan) ===="; tail -n 200 /tmp/ws.log
-          if grep -Eqi 'ABORT|Could not prepare|Table .* doesn.t exist|Unknown column|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize' /tmp/ws.log; then
-            echo "!! worldserver 暴露致命错误"; FAIL=1
+          echo "==== worldserver log (FULL scan, last 400 for review) ===="; cat -v /tmp/ws.log | sed 's/\^\[\[[0-9;]*m//g' | tail -n 400
+          # 最终进程状态复核（覆盖"ready 后又崩"低概率）
+          CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
+          if [ -n "$CID" ]; then
+            ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
+            EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
+            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! worldserver 崩溃退出(code=$EC)"; FAIL=1; fi
           fi
-          # ---- 地图/DBC 加载验证（仅当本流程确实供给了地图数据时判致命；否则白名单兜住，避免无地图误挂）----
-          if [ "${MAP_PROVISIONED:-false}" = "true" ]; then
-            if grep -Eqi 'Could not find required DBC files|Map file .* does not exist|Loading Map.*failed|DBC file .* not found' /tmp/ws.log; then
-              echo "!! worldserver 地图/DBC 加载失败（地图数据缺失或结构错误）"; FAIL=1
+          if [ "$WS_READY" != "1" ] && [ "$WS_EXITED" != "1" ]; then echo "!! worldserver 超时未 ready 也未崩溃（起不来，通用判 FAIL）"; FAIL=1; fi
+          # 通用红色错误检测：覆盖 DBC/maps/模组/配置任意 AC 标红的强制错误，不枚举文案
+          if grep -Ea "$RED_RE" /tmp/ws.log; then echo "!! worldserver 日志含 AC 红色错误标记（强制错误）"; FAIL=1; fi
+
+          # ===== 3) authserver：同理 =====
+          AS_READY=0; AS_EXITED=0; AS_CODE=0
+          for i in $(seq 1 30); do
+            CID=$(docker compose ps -q ac-authserver 2>/dev/null)
+            if [ -n "$CID" ]; then
+              ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
+              EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
+              if [ "$ST" = "exited" ]; then AS_EXITED=1; AS_CODE=$EC; break; fi
             fi
-          else
-            echo "（主流程未供给地图 MAP_PROVISIONED=false：地图/DBC 缺失告警按白名单忽略；地图验证见 build-maps.yml）"
-          fi
-          # ---- authserver（登录必需，之前漏查）----
-          AS_SEEN=0
-          for i in $(seq 1 60); do
-            docker compose ps ac-authserver --status running -q >/dev/null 2>&1 && AS_SEEN=1 && break
+            docker compose logs ac-authserver 2>/dev/null > /tmp/as.log || true
+            if grep -Eqi 'Authserver is ready|accepting connections' /tmp/as.log; then AS_READY=1; break; fi
             sleep 5
           done
-          if [ "$AS_SEEN" != "1" ]; then echo "!! authserver 容器未运行（登录服务缺失）"; FAIL=1; fi
           docker compose logs ac-authserver 2>/dev/null > /tmp/as.log || true
-          echo "==== authserver log (full scan) ===="; tail -n 80 /tmp/as.log
-          if grep -Eqi 'ABORT|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize|Database .* does not exist' /tmp/as.log; then
-            echo "!! authserver 暴露致命错误"; FAIL=1
+          echo "==== authserver log (FULL scan, last 200 for review) ===="; cat -v /tmp/as.log | sed 's/\^\[\[[0-9;]*m//g' | tail -n 200
+          CID=$(docker compose ps -q ac-authserver 2>/dev/null)
+          if [ -n "$CID" ]; then
+            ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
+            EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
+            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! authserver 崩溃退出(code=$EC)"; FAIL=1; fi
           fi
-          # ---- 通用功能完整性 gate（所有模组/核心，不限于 playerbots）----
-          # 任何模组 auto-populate 失败都会让 worldserver 打 error 但不退出（exit 0），导致“构建绿但功能缺”。
-          # 这里统一暴露并在最后一步判停：
-          # (a) 任意模组 data/sql base 目录缺失的铁证（auto-populate 找不到 SQL）
+          if [ "$AS_READY" != "1" ] && [ "$AS_EXITED" != "1" ]; then echo "!! authserver 超时未 ready 也未崩溃"; FAIL=1; fi
+          if grep -Ea "$RED_RE" /tmp/as.log; then echo "!! authserver 日志含 AC 红色错误标记"; FAIL=1; fi
+
+          # ===== 4) 通用功能完整性 gate（结构级断言，内容无关文案）=====
+          # (a) 模组 data/sql base 目录缺失铁证（auto-populate 找不到 SQL）
+          if grep -Eqi 'Directory .*/data/sql/.*/base/ not exist' /tmp/ws.log; then echo "!! 模组 data/sql base 目录缺失（auto-populate 失败）"; FAIL=1; fi
           # (b) DB 结构与核心/模组版本未对齐（updates 未应用，全库通用致命信号）
-          # (c) 动态验证所有模组独立库（扫 modules/*/data/sql/ 下非 world/characters/auth 子目录 -> acore_<子目录>）
-          # (d) 核心三库 auth/characters/world 必非空
-          if grep -Eqi 'Directory .*/data/sql/.*/base/ not exist' /tmp/ws.log; then
-            echo "!! worldserver 日志检测到某模组 data/sql base 目录缺失（auto-populate 失败），部署功能不完整"; FAIL=1
-          fi
-          if grep -Eqi 'Your database structure is not up to date|Please make sure you.ve executed all queries in the sql/updates folders' /tmp/ws.log; then
-            echo "!! DB 结构与核心/模组版本未对齐（updates 未应用），部署功能不完整"; FAIL=1
-          fi
+          if grep -Eqi 'Your database structure is not up to date|Please make sure you.ve executed all queries in the sql/updates folders' /tmp/ws.log; then echo "!! DB 结构与核心/模组版本未对齐（updates 未应用）"; FAIL=1; fi
+          # (c)(d) 动态验证所有 acore_* 库（含核心三库）非空；空即 auto-populate 失败
           check_lib() {
             local lib="$1"; local T=0
             if docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$lib'" >/tmp/lib.log 2>&1; then
               T=$(grep -Eo '[0-9]+' /tmp/lib.log | head -1)
             fi
             echo "$lib tables = ${T:-0}"
-            if [ "${T:-0}" -eq 0 ]; then
-              echo "!! 库 $lib 为空（auto-populate 失败），部署功能不完整"; FAIL=1
-            fi
+            if [ "${T:-0}" -eq 0 ]; then echo "!! 库 $lib 为空（auto-populate 失败）"; FAIL=1; fi
           }
-          # (c) 模组独立库（动态适配新模组，无需硬编码）：直接查 MySQL 实际存在的 acore_ 库、排除核心三库，
-          # 空即 fail。不再靠目录名猜库——某些模组用 data/sql/db_auth、db_characters、db_world、manual
-          # 等增补目录，被误当成独立库会拼出 acore_db-auth 之类不存在的库名导致误报。
           MOD_LIBS=$(docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'acore_%'" 2>/dev/null | grep -vE '^(acore_auth|acore_characters|acore_world)$' | tr -d '\r')
-          if [ -n "$MOD_LIBS" ]; then
-            for lib in $MOD_LIBS; do
-              check_lib "$lib"
-            done
-          else
-            echo "（无额外模组独立库，跳过）"
-          fi
-          # (d) 核心三库
-          for lib in acore_auth acore_characters acore_world; do
-            check_lib "$lib"
-          done
-          if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误，停（不冻库不打包）"; exit 1; fi
-          echo "部署无错误（db-import 完成 + worldserver 运行中且无致命错误）"
+          if [ -n "$MOD_LIBS" ]; then for lib in $MOD_LIBS; do check_lib "$lib"; done; else echo "（无额外模组独立库，跳过）"; fi
+          for lib in acore_auth acore_characters acore_world; do check_lib "$lib"; done
 
+          # ===== 5) 诊断输出：所有红色行（strip 颜色码便于阅读）=====
+          echo "==== 诊断：worldserver 红色错误行 ===="
+          grep -Ea "$RED_RE" /tmp/ws.log | cat -v | sed 's/\^\[\[[0-9;]*m//g' | head -20 || true
+          echo "==== 诊断：authserver 红色错误行 ===="
+          grep -Ea "$RED_RE" /tmp/as.log | cat -v | sed 's/\^\[\[[0-9;]*m//g' | head -20 || true
+
+          if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误，停（不冻库不打包）"; exit 1; fi
+          echo "部署无错误（db-import 完成 + worldserver/authserver 运行且无 AC 红色错误 + 所有库非空）"
       - name: Freeze database (优雅停库→拷数据目录→压缩) 仅部署干净才到这
         if: success()
         run: |
