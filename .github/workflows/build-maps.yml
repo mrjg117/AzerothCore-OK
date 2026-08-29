@@ -1,68 +1,78 @@
 name: build-maps
 
+# 地图数据独立流水线（低频 / 手动触发；地图很久不变）。
+# 职责：从公开源 wowgaming/client-data 拉取地图（带重试+代理），校验非空（空→FAIL 拦截，杜绝 86B 空包），
+#       打包 ac-maps-latest.tar.zst 上传。fork 安全：下载走公开源，不依赖任何个人存储。
+# 注：本流程只验证“地图包真实可用”（非空 + 含 maps/dbc/vmaps/mmaps 结构）；worldserver 真加载的端到端
+#     集成测试若需要可在后续追加（需构建 core 镜像，较重）。
+
 on:
   workflow_dispatch:
-  # 定期打包：取消注释启用，三选一（默认只手动）
-  # schedule:
-  #   - cron: '0 5 * * *'     # 每日 05:00 UTC
-  #   - cron: '0 5 * * 1'     # 每周一 05:00 UTC
-  #   - cron: '0 5 1 * *'     # 每月 1 号 05:00 UTC
-
-env:
-  CLIENT_DATA_REF: v20.0   # wowgaming/client-data Release tag（pinned，换源改这里）
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-maps.yml'
 
 permissions:
   contents: read
-  packages: write
+  actions: write
+
+env:
+  ACORE_REF: Playerbot
+  CLIENT_DATA_REF: v20.0
 
 jobs:
-  build:
+  build-maps:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
     steps:
-      - name: Checkout this repo
+      - name: Checkout project (AzerothCore-OK)
         uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          path: project
 
-      - name: Download wowgaming/client-data@${{ env.CLIENT_DATA_REF }} Data.zip
+      - name: Download client data (robust, public source)
         run: |
-          VER="${{ env.CLIENT_DATA_REF }}"
-          echo "Downloading https://github.com/wowgaming/client-data/releases/download/$VER/Data.zip"
-          curl -L -o /tmp/data.zip "https://github.com/wowgaming/client-data/releases/download/$VER/Data.zip"
-          mkdir -p config/maps/data
-          rm -rf /tmp/extracted && mkdir -p /tmp/extracted
-          unzip -q /tmp/data.zip -d /tmp/extracted
-          # Data.zip 内部可能是 Data/ 顶层目录或直接 Maps/ 等；统一剥到 config/maps/data/ 顶层
-          if [ -d /tmp/extracted/Data ]; then
-            mv /tmp/extracted/Data/* config/maps/data/
-          else
-            mv /tmp/extracted/* config/maps/data/
+          set -e
+          VERSION="${{ env.CLIENT_DATA_REF }}"
+          URL="https://github.com/wowgaming/client-data/releases/download/$VERSION/data.zip"
+          docker volume create ac-client-data
+          for attempt in 1 2 3 4 5; do
+            echo "== download attempt $attempt =="
+            if docker run --rm -v ac-client-data:/data alpine sh -c "cd /data && curl -L --retry 5 --retry-delay 5 -o data.zip '$URL' && unzip -q -o data.zip -d . && rm -f data.zip && echo INSTALLED"; then
+              break
+            fi
+            echo "!! attempt $attempt failed, retrying"; sleep 5
+          done
+          echo "== volume contents =="
+          docker run --rm -v ac-client-data:/data alpine sh -c "ls -la /data; echo 'file count:'; find /data -type f | wc -l"
+
+      - name: Verify non-empty (阻断空包)
+        run: |
+          set -e
+          CNT=$(docker run --rm -v ac-client-data:/data alpine sh -c "find /data -type f | wc -l")
+          echo "data file count = $CNT"
+          if [ "${CNT:-0}" -eq 0 ]; then
+            echo "!! 地图数据为空（下载失败），阻断打包，避免 86B 空包上传"
+            exit 1
           fi
-          echo "--- data layout ---"
-          ls -1 config/maps/data
+          docker run --rm -v ac-client-data:/data alpine sh -c "ls -d /data/maps /data/dbc /data/vmaps /data/mmaps >/dev/null 2>&1 || { echo MISSING_DIRS; exit 1; }"
+          echo "== 地图结构校验通过 (maps/ dbc/ vmaps/ mmaps/ 均存在) =="
 
-      - name: Compute VERSION
-        id: ver
-        run: echo "version=$(date +%Y%m%d)-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
-
-      - name: Build & push ac-maps (ghcr.io)
+      - name: Package ac-maps-latest.tar.zst
         run: |
-          TAGS="ghcr.io/${{ github.repository_owner }}/ac-maps:${{ steps.ver.outputs.version }},ghcr.io/${{ github.repository_owner }}/ac-maps:latest"
-          BUILDX_TAGS=""
-          IFS=',' read -ra _arr <<< "$TAGS"
-          for _t in "${_arr[@]}"; do BUILDX_TAGS="$BUILDX_TAGS --tag $_t"; done
-          docker buildx build $BUILDX_TAGS --push config/maps
+          set -e
+          mkdir -p /tmp/bundle
+          docker run --rm -v ac-client-data:/data -v /tmp/bundle:/out busybox tar -cf - -C /data . | zstd -o /tmp/bundle/ac-maps.tar.zst
+          ls -lh /tmp/bundle/ac-maps.tar.zst
+          SZ=$(stat -c%s /tmp/bundle/ac-maps.tar.zst)
+          echo "package bytes = $SZ"
+          if [ "${SZ:-0}" -lt 1048576 ]; then
+            echo "!! 地图包过小（$SZ B），疑似空包，阻断上传"; exit 1
+          fi
+          cp /tmp/bundle/ac-maps.tar.zst "${{ github.workspace }}/ac-maps-latest.tar.zst"
 
-      - name: Save maps image to bundle & upload to external storage (整镜像打包)
+      - name: Build final tarball + upload
         env:
           ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
           ONEDRIVE_TENANT: ${{ secrets.ONEDRIVE_TENANT }}
@@ -78,61 +88,9 @@ jobs:
           S3_REGION: ${{ secrets.S3_REGION }}
         run: |
           set -e
-          NS="ghcr.io/${{ github.repository_owner }}"
-          docker pull "$NS/ac-maps:latest"
-          docker save "$NS/ac-maps:latest" | zstd -T0 -o ac-maps-latest.tar.zst
+          cd "${{ github.workspace }}"
           sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
-          # OneDrive 走 Graph 直传（onedrive_upload.py），无需 rclone；
-          # rclone 仅 S3 后端需要 —— 仅当配置了 S3 凭证才安装（官方 runner 默认不含）
-          if [ -n "$S3_BUCKET" ]; then
-            curl -sSfL https://rclone.org/install.sh | sudo bash
-            command -v rclone || { echo "rclone 安装失败" >&2; exit 1; }
-          fi
+          ls -lh ac-maps-latest.tar.zst
           pip install --quiet msal 2>/dev/null || true
-          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
-          bash "${{ github.workspace }}/acore-build-repo/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
-
-      - name: Cleanup extracted data (不落盘)
-        if: always()
-        run: rm -rf config/maps/data /tmp/data.zip /tmp/extracted
-
-      - name: Set package visibility public (供服务器匿名 pull)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -sS -X PATCH \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/user/packages/container/${{ github.repository_owner }}%2Fac-maps/visibility" \
-            -d '{"visibility":"public"}'
-
-      - name: Prune old versions (keep latest 12)
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KEEP: "12"
-        run: |
-          set +e
-          owner="${{ github.repository_owner }}"
-          # 包名形如 owner/repo，斜杠需编码为 %2F（纯 bash，不依赖 python3）
-          enc() { local s="$1"; s="${s/\//%2F}"; printf '%s' "$s"; }
-          otype=$(gh api "users/$owner" --jq '.type' 2>/dev/null)
-          if [ "$otype" = "Organization" ]; then base="orgs/$owner/packages/container"; else base="user/packages/container"; fi
-          prune() {
-            local pkg="$1" e ids ids_arr=() n i vid
-            e=$(enc "$pkg")
-            echo "pruning $pkg (enc=$e)"
-            ids=$(gh api "$base/$e/versions?per_page=100" --jq 'sort_by(.created_at)|reverse|.[].id' 2>/dev/null)
-            if [ -z "$ids" ]; then echo "  no versions, skip"; return 0; fi
-            while IFS= read -r line; do [ -n "$line" ] && ids_arr+=("$line"); done <<< "$ids"
-            n=${#ids_arr[@]}
-            if [ "$n" -le "${KEEP}" ]; then echo "  $n <= ${KEEP}, keep all"; return 0; fi
-            echo "  $n versions, deleting $((n-KEEP)) oldest"
-            for ((i=KEEP; i<n; i++)); do
-              vid="${ids_arr[i]}"
-              if gh api -X DELETE "$base/$e/versions/$vid" >/dev/null 2>&1; then echo "  deleted $vid"; else echo "  FAILED $vid"; fi
-            done
-          }
-          prune "$owner/ac-maps"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"

@@ -15,7 +15,7 @@ name: build-static-verify
   #   4) docker compose --profile tools build         （官方编译；跑完暴露全部错误，有错才停在打包前）
   #   5) docker compose up -d --no-build              （官方部署；跑完暴露全部错误，有错才停在打包前）
 #   6) grep 暴露 db-import / worldserver 错误        （收全错误，不早退）
-#   7) 全干净才冻库（停 mysql→拷数据目录→压）+ 打包（5 镜像 + etc + 冻库 + 地图）→ 上传
+#   7) 全干净才冻库（停 mysql→拷数据目录→压）+ 打包（5 镜像 + etc + 冻库；地图由 build-maps.yml 单独打包）→ 上传
 #   任一步失败 → 后续不跑（不冻库不打包），日志全暴露。
 
 on:
@@ -154,6 +154,11 @@ jobs:
       - name: Bring up stack (官方部署)
         run: |
           cd "${{ github.workspace }}/official"
+          # 主流程 intentionally 不拉地图：地图很久不变，且避免每次 run 现拉 ~400MB（地图验证交给 build-maps.yml）。
+          # 把官方 ac-client-data-init 降级为 no-op（直接 exit 0），既满足 worldserver 的 depends_on
+          # service_completed_successfully 条件，又不会每次从 wowgaming 现拉地图。卷留空，worldserver 无地图启动，
+          # 地图相关告警在下方 gate 白名单内（MAP_PROVISIONED=false）。
+          printf 'services:\n  ac-client-data-init:\n    command: ["true"]\n    restart: "no"\n' > noop-init.yml
           # 官方 bind-mount 权限坑（官方 entrypoint 警告明写）：
           #   ac-db-import/worldserver/authserver 把 host 的 ./env/dist/etc、./env/dist/logs 挂进容器，
           #   容器以 acore(uid 1000) 跑；CI 里 Docker 守护进程是 root，自动创建的 bind 目录是 root 所有
@@ -165,8 +170,8 @@ jobs:
           # --no-build：用刚编好的本地镜像起栈；mysql:8.4 / client-data(从 wowgaming 拉地图) 按官方现场来
           # 注意：db-import/worldserver 任一退出非零，compose up 会返回非0；此处用 || 接住，
           #       不让整步 abort，交下一步抓取容器日志、扫描致命错误（符合“部署错全扫、暴露全部”）。
-          docker compose up -d --no-build || echo "!! docker compose up 返回非零（有服务未正常起/退出），交下一步抓日志"
-          docker compose ps
+          docker compose -f docker-compose.yml -f noop-init.yml up -d --no-build || echo "!! docker compose up 返回非零（有服务未正常起/退出），交下一步抓日志"
+          docker compose -f docker-compose.yml -f noop-init.yml ps
 
       - name: Expose deployment errors (db-import + worldserver；收全不早退)
         run: |
@@ -174,6 +179,7 @@ jobs:
           cd "${{ github.workspace }}/official"
           set -a; [ -f .env ] && . ./.env; set +a
           FAIL=0
+          MAP_PROVISIONED=false
           # ---- db-import（一次性任务，exit 非0 即失败）----
           docker compose logs ac-db-import > /tmp/dbimport.log 2>&1 || true
           echo "==== db-import log (FULL) ===="; cat /tmp/dbimport.log
@@ -194,12 +200,38 @@ jobs:
             sleep 5
           done
           if [ "$WS_SEEN" != "1" ]; then echo "!! worldserver 容器未运行（启动失败/崩溃）"; FAIL=1; fi
-          # 容器起来了，再等初始化完成，全量扫日志（不早退、不 break）
-          sleep 60
-          docker compose logs ac-worldserver > /tmp/ws.log 2>&1 || true
+          # 轮询直到 worldserver 真正 ready（出现就绪标记）或超时，再全量扫日志。
+          # 不再固定 sleep 60——地图/DBC 加载在配置阶段之后，固定窗口会漏掉晚期致命错误（之前空数据假绿的根因）。
+          for i in $(seq 1 60); do
+            docker compose logs ac-worldserver 2>/dev/null > /tmp/ws.log || true
+            if grep -Eqi 'azerothcore>|WorldSession|World initialized|server is (now )?accepting|Worldserver is ready' /tmp/ws.log; then break; fi
+            if grep -Eqi 'ABORT|Could not prepare|Table .* doesn.t exist|Unknown column|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize' /tmp/ws.log; then break; fi
+            sleep 10
+          done
+          docker compose logs ac-worldserver 2>/dev/null > /tmp/ws.log || true
           echo "==== worldserver log (full scan) ===="; tail -n 200 /tmp/ws.log
           if grep -Eqi 'ABORT|Could not prepare|Table .* doesn.t exist|Unknown column|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize' /tmp/ws.log; then
             echo "!! worldserver 暴露致命错误"; FAIL=1
+          fi
+          # ---- 地图/DBC 加载验证（仅当本流程确实供给了地图数据时判致命；否则白名单兜住，避免无地图误挂）----
+          if [ "${MAP_PROVISIONED:-false}" = "true" ]; then
+            if grep -Eqi 'Could not find required DBC files|Map file .* does not exist|Loading Map.*failed|DBC file .* not found' /tmp/ws.log; then
+              echo "!! worldserver 地图/DBC 加载失败（地图数据缺失或结构错误）"; FAIL=1
+            fi
+          else
+            echo "（主流程未供给地图 MAP_PROVISIONED=false：地图/DBC 缺失告警按白名单忽略；地图验证见 build-maps.yml）"
+          fi
+          # ---- authserver（登录必需，之前漏查）----
+          AS_SEEN=0
+          for i in $(seq 1 60); do
+            docker compose ps ac-authserver --status running -q >/dev/null 2>&1 && AS_SEEN=1 && break
+            sleep 5
+          done
+          if [ "$AS_SEEN" != "1" ]; then echo "!! authserver 容器未运行（登录服务缺失）"; FAIL=1; fi
+          docker compose logs ac-authserver 2>/dev/null > /tmp/as.log || true
+          echo "==== authserver log (full scan) ===="; tail -n 80 /tmp/as.log
+          if grep -Eqi 'ABORT|Segmentation|SIGSEGV|FATAL|panic|refused to start|cannot (load|open)|failed to initialize|Database .* does not exist' /tmp/as.log; then
+            echo "!! authserver 暴露致命错误"; FAIL=1
           fi
           # ---- 通用功能完整性 gate（所有模组/核心，不限于 playerbots）----
           # 任何模组 auto-populate 失败都会让 worldserver 打 error 但不退出（exit 0），导致“构建绿但功能缺”。
@@ -283,8 +315,8 @@ jobs:
           tar -cf /tmp/bundle/etc.tar.zst -I zstd -C /tmp/bundle/etc .
           # 冻库
           cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
-          # 地图（从官方 client-data 卷导出）
-          docker run --rm -v ac-client-data:/data -v /tmp/bundle:/out busybox tar -cf - -C /data . | zstd -o /tmp/bundle/ac-maps.tar.zst
+          # 地图不在此打包：由独立工作流 build-maps.yml 下载/校验/打包（ac-maps-latest.tar.zst），
+          # 避免主流程每次拉 ~400MB 地图，也避免此前 86B 空包误上传。
           echo "== bundle contents =="; ls -lh /tmp/bundle/
 
       - name: Build final tarballs + upload
@@ -306,16 +338,12 @@ jobs:
           set -e
           cd /tmp/bundle
           tar -cf "${{ github.workspace }}/ac-bundle-latest.tar.zst" -I zstd -C /tmp/bundle .
-          cp /tmp/bundle/ac-maps.tar.zst "${{ github.workspace }}/ac-maps-latest.tar.zst"
           cd "${{ github.workspace }}"
           sha256sum ac-bundle-latest.tar.zst > ac-bundle-latest.tar.zst.sha256
-          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
-          ls -lh ac-bundle-latest.tar.zst ac-maps-latest.tar.zst
+          ls -lh ac-bundle-latest.tar.zst
           pip install --quiet msal 2>/dev/null || true
           bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
           bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
-          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
-          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
 
       - name: Tear down (数据已冻进包，此处删卷)
         if: always()
