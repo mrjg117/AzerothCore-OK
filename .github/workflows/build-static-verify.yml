@@ -48,14 +48,26 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        id: setup-buildx
 
       - name: Cache ccache (跨 run 持久化)
         uses: actions/cache@v4
+        id: cache-ccache
         with:
           path: /home/runner/.cache/ccache
           key: ccache-${{ github.sha }}
           restore-keys: |
             ccache-
+
+      - name: Restore ccache cache mount (buildkit-cache-dance)
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.setup-buildx.outputs.name }}
+          cache-map: |
+            {
+              "/home/runner/.cache/ccache": "/ccache"
+            }
+          skip-extraction: ${{ steps.cache-ccache.outputs.cache-hit }}
 
       - name: Clone official Playerbot core @ ${{ env.ACORE_REF }}
         run: |
@@ -126,11 +138,12 @@ jobs:
           set -e
           cd "${{ github.workspace }}/official"
           mkdir -p /home/runner/.cache/ccache
-          # 缓存：docker-compose.override.yml 给各 build 服务加 build.cache_from/to: type=gha（编译层缓存）
-          #   及 additional_contexts.ccache（把 actions/cache 持久化的 /home/runner/.cache/ccache 注入为
-          #   build-context，供 core build-patch 改后的 Dockerfile `RUN --mount=type=bind,from=ccache` 使用，
-          #   实现 ccache 跨 run 复用，已编过的 .o 不重编）。均为项目侧 override，不改任何官方文件。
-          #   效果：同内容构建命中缓存秒过；模组/源码变了对应层自动 miss 重编（内容寻址，不掩盖错误）。
+          # 缓存：docker-compose.override.yml 给各 build 服务加 build.cache_from/to: type=gha（编译层缓存）。
+          #   ccache 跨 run 复用走 buildkit-cache-dance（见上方 Restore ccache cache mount step）：
+          #   官方 Dockerfile `RUN --mount=type=cache,target=/ccache` 是 BuildKit named cache，不被任何
+          #   --cache-to 后端导出；cache-dance 把 actions/cache 持久化的宿主 /home/runner/.cache/ccache
+          #   注入/提取进构建容器 /ccache，实现 ccache 真复用。均为项目侧 CI，不改任何官方文件。
+          #   效果：同内容 .o 命中 ccache 秒过；源码变了对应目标自动重编（内容寻址，不掩盖错误）。
           cp "${{ github.workspace }}/project/docker-compose.override.yml" ./docker-compose.override.yml
           # 官方 CMODULES 默认 static（Dockerfile ARG），不覆盖。core build-patch(keep_going.sh) 已给 cmake --build 加 -- -k 0（官方用 Ninja 生成器，-k 必须带数字 0=无限继续），遇错继续编译、暴露全部模组错误。
           # --profile tools 放 docker compose 全局位（compose v2 的 --profile 是全局 flag，不能放 build 子命令后），一并编 tools 进大包。

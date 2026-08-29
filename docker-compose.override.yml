@@ -1,7 +1,7 @@
 # 项目侧 compose override：仅给各 build 服务加 GitHub Actions 层缓存（type=gha）。
 # 不改任何官方文件；由 CI 在 `docker compose build` 前 cp 进 official/ 目录自动合并。
 # - cache_from/to: type=gha：编译层存入 GHA 缓存，同内容构建命中缓存；模组/源码变了对应层自动 miss 重编。
-# 注：ccache 编译器缓存由 CI（build-core.yml 的 buildkit-cache-dance）跨 run 持久化，不经本 override；
+# 注：ccache 编译器缓存由 CI（build-core.yml / build-static-verify.yml 的 buildkit-cache-dance）跨 run 持久化，不经本 override；
 #     /home/runner/.cache/ccache 是 runner 专用路径，本地 compose build 不使用。
 services:
   ac-db-import:
