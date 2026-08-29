@@ -150,11 +150,13 @@ jobs:
           echo "== unzip =="
           cd /tmp/clientdata && unzip -q -o Data.zip -d extracted || { echo "!! unzip failed"; exit 1; }
           echo "== extracted top-level =="; ls -1 extracted | head
-          SRC=$( (find extracted -maxdepth 3 -type d -name maps; find extracted -maxdepth 3 -type d -name dbc) | head -1 | xargs dirname)
-          [ -z "$SRC" ] && SRC=extracted
+          SRC="/tmp/clientdata/extracted"
+          [ -d "$SRC/maps" ] && [ -d "$SRC/dbc" ] || { echo "!! required dirs missing under $SRC"; ls -1 "$SRC"; exit 1; }
           echo "data source dir = $SRC"
           docker volume create ac-client-data
           docker run --rm -v ac-client-data:/data -v "$SRC":/src busybox sh -c "cd /src && tar cf - . | (cd /data && tar xf -) && echo COPIED"
+          # 保证 worldserver(acore uid 1000) 能只读读到 root 写入的卷文件
+          docker run --rm -v ac-client-data:/data busybox sh -c "chmod -R a+rX /data"
           echo "== volume contents =="
           docker run --rm -v ac-client-data:/data busybox sh -c "echo file count:; find /data -type f | wc -l; ls -d /data/maps /data/dbc /data/vmaps /data/mmaps 2>/dev/null"
 
