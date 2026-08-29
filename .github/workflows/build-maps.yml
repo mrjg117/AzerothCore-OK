@@ -1,10 +1,12 @@
 name: build-maps
 
 # 地图数据独立流水线（低频 / 手动触发；地图很久不变）。
-# 职责：从公开源 wowgaming/client-data 拉取地图（带重试+代理），校验非空（空→FAIL 拦截，杜绝 86B 空包），
-#       打包 ac-maps-latest.tar.zst 上传。fork 安全：下载走公开源，不依赖任何个人存储。
-# 注：本流程只验证“地图包真实可用”（非空 + 含 maps/dbc/vmaps/mmaps 结构）；worldserver 真加载的端到端
-#     集成测试若需要可在后续追加（需构建 core 镜像，较重）。
+# 职责：从公开源 wowgaming/client-data 拉取地图（runner 本地 curl+unzip，带重试+代理），
+#       校验非空（空→FAIL 拦截，杜绝 86B 空包），打包 ac-maps-latest.tar.zst 上传。
+#       fork 安全：下载走公开源，不依赖任何个人存储。
+# 修正：原实现在 alpine 容器内跑 curl（alpine 默认无 curl）→ 全程失败；
+#       URL 误写为 data.zip（应为 Data.zip，GitHub release 大小写敏感）→ 即便装了 curl 也 404。
+#       改为 CI runner（ubuntu-latest 自带 curl+unzip）本地下载后注入 ac-client-data 卷。
 
 on:
   workflow_dispatch:
@@ -31,32 +33,41 @@ jobs:
         with:
           path: project
 
-      - name: Download client data (robust, public source)
+      - name: Download client data (real, runner-local, public source)
         run: |
           set -e
           VERSION="${{ env.CLIENT_DATA_REF }}"
-          URL="https://github.com/wowgaming/client-data/releases/download/$VERSION/data.zip"
-          docker volume create ac-client-data
+          URL="https://github.com/wowgaming/client-data/releases/download/$VERSION/Data.zip"
+          mkdir -p /tmp/clientdata
           for attempt in 1 2 3 4 5; do
             echo "== download attempt $attempt =="
-            if docker run --rm -v ac-client-data:/data alpine sh -c "cd /data && curl -L --retry 5 --retry-delay 5 -o data.zip '$URL' && unzip -q -o data.zip -d . && rm -f data.zip && echo INSTALLED"; then
+            if curl -L --retry 5 --retry-delay 5 -o /tmp/clientdata/Data.zip "$URL"; then
+              ls -lh /tmp/clientdata/Data.zip
               break
             fi
-            echo "!! attempt $attempt failed, retrying"; sleep 5
+            echo "!! attempt $attempt failed"; sleep 5
           done
+          echo "== unzip =="
+          cd /tmp/clientdata && unzip -q -o Data.zip -d extracted || { echo "!! unzip failed"; exit 1; }
+          echo "== extracted top-level =="; ls -1 extracted | head
+          SRC=$( (find extracted -maxdepth 3 -type d -name maps; find extracted -maxdepth 3 -type d -name dbc) | head -1 | xargs dirname)
+          [ -z "$SRC" ] && SRC=extracted
+          echo "data source dir = $SRC"
+          docker volume create ac-client-data
+          docker run --rm -v ac-client-data:/data -v "$SRC":/src busybox sh -c "cd /src && tar cf - . | (cd /data && tar xf -) && echo COPIED"
           echo "== volume contents =="
-          docker run --rm -v ac-client-data:/data alpine sh -c "ls -la /data; echo 'file count:'; find /data -type f | wc -l"
+          docker run --rm -v ac-client-data:/data busybox sh -c "echo file count:; find /data -type f | wc -l; ls -d /data/maps /data/dbc /data/vmaps /data/mmaps 2>/dev/null"
 
       - name: Verify non-empty (阻断空包)
         run: |
           set -e
-          CNT=$(docker run --rm -v ac-client-data:/data alpine sh -c "find /data -type f | wc -l")
+          CNT=$(docker run --rm -v ac-client-data:/data busybox sh -c "find /data -type f | wc -l")
           echo "data file count = $CNT"
           if [ "${CNT:-0}" -eq 0 ]; then
             echo "!! 地图数据为空（下载失败），阻断打包，避免 86B 空包上传"
             exit 1
           fi
-          docker run --rm -v ac-client-data:/data alpine sh -c "ls -d /data/maps /data/dbc /data/vmaps /data/mmaps >/dev/null 2>&1 || { echo MISSING_DIRS; exit 1; }"
+          docker run --rm -v ac-client-data:/data busybox sh -c "ls -d /data/maps /data/dbc /data/vmaps /data/mmaps >/dev/null 2>&1 || { echo MISSING_DIRS; exit 1; }"
           echo "== 地图结构校验通过 (maps/ dbc/ vmaps/ mmaps/ 均存在) =="
 
       - name: Package ac-maps-latest.tar.zst

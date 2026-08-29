@@ -133,6 +133,31 @@ jobs:
           printf 'DOCKER_DB_ROOT_PASSWORD=ci-test\nSOAP_LOGIN=ci-test\nSOAP_PASSWORD=ci-test\n' > .env
           echo "== .env written =="; cat .env
 
+      - name: Download client data (real maps, public source) for full verification
+        run: |
+          set -e
+          VERSION="${{ env.CLIENT_DATA_REF }}"
+          URL="https://github.com/wowgaming/client-data/releases/download/$VERSION/Data.zip"
+          mkdir -p /tmp/clientdata
+          for attempt in 1 2 3 4 5; do
+            echo "== download attempt $attempt =="
+            if curl -L --retry 5 --retry-delay 5 -o /tmp/clientdata/Data.zip "$URL"; then
+              ls -lh /tmp/clientdata/Data.zip
+              break
+            fi
+            echo "!! attempt $attempt failed"; sleep 5
+          done
+          echo "== unzip =="
+          cd /tmp/clientdata && unzip -q -o Data.zip -d extracted || { echo "!! unzip failed"; exit 1; }
+          echo "== extracted top-level =="; ls -1 extracted | head
+          SRC=$( (find extracted -maxdepth 3 -type d -name maps; find extracted -maxdepth 3 -type d -name dbc) | head -1 | xargs dirname)
+          [ -z "$SRC" ] && SRC=extracted
+          echo "data source dir = $SRC"
+          docker volume create ac-client-data
+          docker run --rm -v ac-client-data:/data -v "$SRC":/src busybox sh -c "cd /src && tar cf - . | (cd /data && tar xf -) && echo COPIED"
+          echo "== volume contents =="
+          docker run --rm -v ac-client-data:/data busybox sh -c "echo file count:; find /data -type f | wc -l; ls -d /data/maps /data/dbc /data/vmaps /data/mmaps 2>/dev/null"
+
       - name: Build core images (官方编译 + core补丁加-k 暴露全部错误；有错停在打包前)
         run: |
           set -e
@@ -154,10 +179,10 @@ jobs:
       - name: Bring up stack (官方部署)
         run: |
           cd "${{ github.workspace }}/official"
-          # 主流程 intentionally 不拉地图：地图很久不变，且避免每次 run 现拉 ~400MB（地图验证交给 build-maps.yml）。
-          # 把官方 ac-client-data-init 降级为 no-op（直接 exit 0），既满足 worldserver 的 depends_on
-          # service_completed_successfully 条件，又不会每次从 wowgaming 现拉地图。卷留空，worldserver 无地图启动，
-          # 地图相关告警在下方 gate 白名单内（MAP_PROVISIONED=false）。
+          # 真实下载地图（上一步已把公开源 Data.zip 下载并注入 ac-client-data 卷）。
+          # 把官方 ac-client-data-init 降级为 no-op（直接 exit 0），仅用于满足 worldserver 的 depends_on
+          # service_completed_successfully 条件，避免官方 init 再重复现拉 ~400MB。
+          # 卷已是真实地图数据，worldserver 带地图启动；下方 gate 以 MAP_PROVISIONED=true 校验 DBC/maps 强制错误。
           printf 'services:\n  ac-client-data-init:\n    command: ["true"]\n    restart: "no"\n' > noop-init.yml
           # 官方 bind-mount 权限坑（官方 entrypoint 警告明写）：
           #   ac-db-import/worldserver/authserver 把 host 的 ./env/dist/etc、./env/dist/logs 挂进容器，
@@ -179,7 +204,7 @@ jobs:
           cd "${{ github.workspace }}/official"
           set -a; [ -f .env ] && . ./.env; set +a
           FAIL=0
-          MAP_PROVISIONED=false
+          MAP_PROVISIONED=true
           # ---- db-import（一次性任务，exit 非0 即失败）----
           docker compose logs ac-db-import > /tmp/dbimport.log 2>&1 || true
           echo "==== db-import log (FULL) ===="; cat /tmp/dbimport.log
