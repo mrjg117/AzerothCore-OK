@@ -15,7 +15,7 @@ name: build-static-verify
   #   4) docker compose --profile tools build         （官方编译；跑完暴露全部错误，有错才停在打包前）
   #   5) docker compose up -d --no-build              （官方部署；跑完暴露全部错误，有错才停在打包前）
 #   6) grep 暴露 db-import / worldserver 错误        （收全错误，不早退）
-#   7) 全干净才冻库（停 mysql→拷数据目录→压）+ 打包（5 镜像 + etc + 冻库；地图由 build-maps.yml 单独打包）→ 上传
+#   7) 全干净才冻库（停 mysql→拷数据目录→压）+ 打包（5 镜像 + etc + 冻库 + 地图 ac-maps-latest.tar.zst，同工作流内 Package map data 步）→ 上传
 #   任一步失败 → 后续不跑（不冻库不打包），日志全暴露。
 
 on:
@@ -342,9 +342,27 @@ jobs:
           tar -cf /tmp/bundle/etc.tar.zst -I zstd -C /tmp/bundle/etc .
           # 冻库
           cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
-          # 地图不在此打包：由独立工作流 build-maps.yml 下载/校验/打包（ac-maps-latest.tar.zst），
-          # 避免主流程每次拉 ~400MB 地图，也避免此前 86B 空包误上传。
+          # 地图由下方「Package map data」步从真实 ac-client-data 卷单独打包 ac-maps-latest.tar.zst
+          # （非空护栏，杜绝此前 86B 空包），随同一工作流上传分发。
           echo "== bundle contents =="; ls -lh /tmp/bundle/
+
+      - name: Package map data (real ac-client-data volume, non-empty guard)
+        if: success()
+        run: |
+          set -e
+          # 地图已在“Download client data”步从公开源真实下载并注入 ac-client-data 卷；
+          # 此处仅打包，并先校验非空（杜绝 86B 空包）。
+          CNT=$(docker run --rm -v ac-client-data:/data busybox sh -c "find /data -type f | wc -l")
+          echo "map data file count = $CNT"
+          if [ "${CNT:-0}" -eq 0 ]; then echo "!! 地图卷为空，阻断打包"; exit 1; fi
+          docker run --rm -v ac-client-data:/data busybox sh -c "ls -d /data/maps /data/dbc /data/vmaps /data/mmaps >/dev/null 2>&1 || { echo MISSING_DIRS; exit 1; }"
+          mkdir -p /tmp/bundle
+          docker run --rm -v ac-client-data:/data -v /tmp/bundle:/out busybox tar -cf - -C /data . | zstd -o /tmp/bundle/ac-maps.tar.zst
+          SZ=$(stat -c%s /tmp/bundle/ac-maps.tar.zst)
+          echo "map package bytes = $SZ"
+          if [ "${SZ:-0}" -lt 1048576 ]; then echo "!! 地图包过小，疑似空包"; exit 1; fi
+          cp /tmp/bundle/ac-maps.tar.zst "${{ github.workspace }}/ac-maps-latest.tar.zst"
+          echo "== map package ready =="
 
       - name: Build final tarballs + upload
         if: success()
@@ -371,6 +389,9 @@ jobs:
           pip install --quiet msal 2>/dev/null || true
           bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst"
           bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-bundle-latest.tar.zst.sha256"
+          sha256sum ac-maps-latest.tar.zst > ac-maps-latest.tar.zst.sha256
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst"
+          bash "${{ github.workspace }}/project/.github/scripts/upload_artifacts.sh" "ac-maps-latest.tar.zst.sha256"
 
       - name: Tear down (数据已冻进包，此处删卷)
         if: always()
