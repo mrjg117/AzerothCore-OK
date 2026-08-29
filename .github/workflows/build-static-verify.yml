@@ -185,7 +185,11 @@ jobs:
           # 把官方 ac-client-data-init 降级为 no-op（直接 exit 0），仅用于满足 worldserver 的 depends_on
           # service_completed_successfully 条件，避免官方 init 再重复现拉 ~400MB。
           # 卷已是真实地图数据，worldserver 带地图启动；下方 gate 以 MAP_PROVISIONED=true 校验 DBC/maps 强制错误。
-          printf 'services:\n  ac-client-data-init:\n    command: ["true"]\n    restart: "no"\n' > noop-init.yml
+          # 关键修复：官方 compose 把 ac-client-data 声明成顶层卷且未设 name:，compose 会按项目名自动加前缀
+          # 成 official_ac-client-data；而 Download 步注入的是字面名 ac-client-data → worldserver 挂到空卷 →
+          # "Failed to find map files for starting areas"。这里用 name: 强制字面名，worldserver 挂的就是已注入真实地图的同一卷。
+          # 同时把 init 换成 busybox noop（仅需满足 worldserver 的 depends_on），免拉 client-data 镜像。
+          printf 'services:\n  ac-client-data-init:\n    image: busybox:latest\n    command: ["true"]\n    restart: "no"\nvolumes:\n  ac-client-data:\n    name: ac-client-data\n' > noop-init.yml
           # 官方 bind-mount 权限坑（官方 entrypoint 警告明写）：
           #   ac-db-import/worldserver/authserver 把 host 的 ./env/dist/etc、./env/dist/logs 挂进容器，
           #   容器以 acore(uid 1000) 跑；CI 里 Docker 守护进程是 root，自动创建的 bind 目录是 root 所有
@@ -253,6 +257,20 @@ jobs:
           if [ "$WS_READY" != "1" ] && [ "$WS_EXITED" != "1" ]; then echo "!! worldserver 超时未 ready 也未崩溃（起不来，通用判 FAIL）"; FAIL=1; fi
           # 通用红色错误检测：覆盖 DBC/maps/模组/配置任意 AC 标红的强制错误，不枚举文案
           if grep -Ea "$RED_RE" /tmp/ws.log; then echo "!! worldserver 日志含 AC 红色错误标记（强制错误）"; FAIL=1; fi
+
+          # ===== 2b) 地图落地硬校验：worldserver 容器内必须真能读到 maps/dbc/vmaps/mmaps/Cameras =====
+          # 仅看卷文件数不够——必须确认 worldserver 实际挂载点读得到（卷名前缀错会挂到空卷，上面已修 name:）。
+          # 这一道保证「拿下来就一定能跑」：挂空/路径错在这里直接 FAIL，绝不带着无地图的包过关。
+          WS_CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
+          if [ -n "$WS_CID" ]; then
+            for d in maps dbc vmaps mmaps Cameras; do
+              c=$(docker compose exec -T ac-worldserver sh -c "ls /azerothcore/env/dist/data/$d 2>/dev/null | wc -l" 2>/dev/null)
+              echo "worldserver data/$d files = ${c:-0}"
+              [ "${c:-0}" -gt 0 ] || { echo "!! worldserver 内 data/$d 为空（地图未挂载/路径错，拿下来跑不起来）"; FAIL=1; }
+            done
+          else
+            echo "（worldserver 已退出，跳过容器内地图校验；上方红色错误已捕获）"
+          fi
 
           # ===== 3) authserver：同理 =====
           AS_READY=0; AS_EXITED=0; AS_CODE=0
