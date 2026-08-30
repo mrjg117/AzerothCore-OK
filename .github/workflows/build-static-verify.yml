@@ -136,6 +136,16 @@ jobs:
           done
           echo "== modules mounted + patches applied (错误见上方 [ERR] 与 Gate 汇总) =="
 
+      # 通用 SQL 归置引擎（docs R11）：把"放错位置"的模组 SQL 归置到官方 db-import 能扫到的位置。
+      # 必须在本步之后执行：apply_core_and_gen_sql.sh 会生成仓库里没有的 SQL（item-affixes）。
+      # 全规则驱动、零模组名硬编码、零目录名黑名单；db-import 仍只跑一次。
+      - name: Normalize module SQL paths (通用归置引擎; 全量暴露)
+        run: |
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          bash "${{ github.workspace }}/project/.github/scripts/normalize_module_sql.sh" "${{ github.workspace }}/official"
+          echo "== module SQL normalized (错误见 [ERR] 与 Gate 汇总) =="
+
       # 准备 etc 配置（叠仓库模组 conf，核心 conf 用官方默认）；某个 conf 拷失败也记下来继续，不中途停。
       - name: Prepare etc config (叠仓库模组 conf; 全量暴露)
         run: |
@@ -163,7 +173,7 @@ jobs:
           : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
           rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
           cd "${{ github.workspace }}/official"
-          if printf 'DOCKER_DB_ROOT_PASSWORD=ci-test\nSOAP_LOGIN=ci-test\nSOAP_PASSWORD=ci-test\n' > .env 2>/tmp/env.log; then
+          if printf 'DOCKER_DB_ROOT_PASSWORD=password\nSOAP_LOGIN=ci-test\nSOAP_PASSWORD=ci-test\n' > .env 2>/tmp/env.log; then
             echo "== .env written =="; cat .env
           else
             rec "ENV WRITE FAIL"; tail -n 15 /tmp/env.log
@@ -342,6 +352,60 @@ jobs:
 
           if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误（已记入 /tmp/ci_errors.log，交 Gate 步停打包）"; else echo "部署本地检查无致命错误（Gate 汇总全部环节后最终判定）"; fi
 
+      # ===== 模组 SQL 完整性校验（docs R11 / 4.4.1）=====
+      # L1 声明级：遍历所有模组 .sql 抽 CREATE TABLE / ALTER TABLE ADD COLUMN，与 information_schema 对账。
+      #           直击"表/列是否存在"这个目标，不靠"文件是否应用"当代理指标。
+      # L2 文件级：合规路径 .sql 集合 vs AC 账本（覆盖 MODULE/CUSTOM/RELEASED 三种 state）。
+      #           补 L1 盲区——纯 INSERT/UPDATE 的 data-only 文件漏灌。
+      # 命中即 rec() 记 [ERR]，由 Gate 统一拦下不打包。
+      - name: Verify module SQL completeness (L1 声明级 + L2 文件级对账)
+        run: |
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          rec() { echo "[ERR] $*" | tee -a "$CI_ERR"; }
+          cd "${{ github.workspace }}/official"
+          set -a; [ -f .env ] && . ./.env; set +a
+          SCHEMAS="acore_auth acore_characters acore_world acore_playerbots"
+          IN_LIST=""; for s in $SCHEMAS; do IN_LIST="$IN_LIST'$s',"; done; IN_LIST="${IN_LIST%,}"
+          DBQ() { docker compose exec -T ac-database mysql -uroot -p"$DOCKER_DB_ROOT_PASSWORD" -N -e "$1" 2>/dev/null | grep -v Warning | tr -d '\r' | sort -u; }
+
+          DBQ "SELECT table_name FROM information_schema.tables WHERE table_schema IN ($IN_LIST);" > /tmp/db_tables.txt
+          DBQ "SELECT CONCAT(table_name,'|',column_name) FROM information_schema.columns WHERE table_schema IN ($IN_LIST);" > /tmp/db_cols.txt
+
+          # ---- L1 声明级 ----
+          find modules -name "*.sql" -type f -print0 | xargs -0 grep -ohiE "CREATE[[:space:]]+TABLE[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[\`][A-Za-z_][A-Za-z0-9_]*[\`]" \
+            | grep -oE "[A-Za-z_][A-Za-z0-9_]*\`$" | tr -d '`' | sort -u > /tmp/decl_tables.txt
+          find modules -name "*.sql" -type f -print0 | xargs -0 grep -ohiE "ALTER[[:space:]]+TABLE[[:space:]]+[\`][A-Za-z_][A-Za-z0-9_]*[\`][[:space:]]+ADD[[:space:]]+(COLUMN[[:space:]]+)?(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?[\`][A-Za-z_][A-Za-z0-9_]*[\`]" \
+            | sed -E 's/ALTER[[:space:]]+TABLE[[:space:]]+//I; s/[\`]//g; s/[[:space:]]+ADD([[:space:]]+COLUMN)?([[:space:]]+IF[[:space:]]+NOT[[:space:]]+EXISTS)?[[:space:]]+/|/I' | sort -u > /tmp/decl_cols.txt
+          # 排除"被同仓库后续 DROP TABLE 取代"的废弃表（如 mod-item-affixes 的 character_meta_progression
+          # 被 character_progression_nodes.sql 里的 DROP TABLE 取代）。通用规则，不写死表名。
+          find modules -name "*.sql" -type f -print0 | xargs -0 grep -ohiE "DROP[[:space:]]+TABLE([[:space:]]+IF[[:space:]]+EXISTS)?[[:space:]]+[\`][A-Za-z_][A-Za-z0-9_]*[\`]" \
+            | grep -oE "[A-Za-z_][A-Za-z0-9_]*\`$" | tr -d '`' | sort -u > /tmp/dropped_tables.txt
+          comm -23 /tmp/decl_tables.txt /tmp/dropped_tables.txt > /tmp/decl_tables_eff.txt
+          echo "== L1: 模组声明表 $(wc -l < /tmp/decl_tables.txt)（排除已废弃 $(wc -l < /tmp/dropped_tables.txt)）→ 有效 $(wc -l < /tmp/decl_tables_eff.txt) / 库内表 $(wc -l < /tmp/db_tables.txt) =="
+          comm -23 /tmp/decl_tables_eff.txt /tmp/db_tables.txt > /tmp/miss_tables.txt
+          if [ -s /tmp/miss_tables.txt ]; then echo "!! 声明了但库里没有的表:"; cat /tmp/miss_tables.txt; while read -r t; do [ -n "$t" ] && rec "SQL-L1: 表缺失 $t"; done < /tmp/miss_tables.txt; fi
+          echo "== L1: 模组声明列 $(wc -l < /tmp/decl_cols.txt) =="
+          comm -23 /tmp/decl_cols.txt /tmp/db_cols.txt > /tmp/miss_cols.txt
+          if [ -s /tmp/miss_cols.txt ]; then echo "!! 声明了但库里没有的列:"; cat /tmp/miss_cols.txt; while read -r c; do [ -n "$c" ] && rec "SQL-L1: 列缺失 $c"; done < /tmp/miss_cols.txt; fi
+
+          # ---- L2 文件级 ----
+          # mod-playerbots 不完全排除，只排除两个不该进账本的目录：
+          #   base/   —— 由模组自身安装器应用，不进 updates 账本（排除它，否则满屏假缺失）
+          #   create/ —— 不在 updates_include 白名单内（含 drop_mysql.sql，本就不该灌）
+          # 保留 updates/ custom/ archive/ —— 这三个是其 updates_include 白名单目录，必须全都进账本。
+          find modules -name "*.sql" -type f | grep -iE "/data/sql/[^/]*(auth|characters|world|playerbots)[^/]*/" \
+            | grep -vE "/mod-playerbots/data/sql/playerbots/(base|create)/" \
+            | grep -viE "/(create|drop)_mysql(_8)?\.sql$|/updates\.sql$|/updates_include\.sql$|/version_db_[a-z]+\.sql$" \
+            | sed 's#.*/##' | sort -u > /tmp/exp_files.txt
+          : > /tmp/app_files.txt
+          for s in $SCHEMAS; do DBQ "SELECT name FROM $s.updates WHERE state IN ('MODULE','CUSTOM','RELEASED');" >> /tmp/app_files.txt; done
+          sort -u /tmp/app_files.txt -o /tmp/app_files.txt
+          echo "== L2: 期望灌入 $(wc -l < /tmp/exp_files.txt) / 账本已记 $(wc -l < /tmp/app_files.txt) =="
+          comm -23 /tmp/exp_files.txt /tmp/app_files.txt > /tmp/miss_files.txt
+          if [ -s /tmp/miss_files.txt ]; then echo "!! 该灌未灌:"; cat /tmp/miss_files.txt; while read -r n; do [ -n "$n" ] && rec "SQL-L2: 文件未灌入 $n"; done < /tmp/miss_files.txt; fi
+          echo "== 模组 SQL 完整性校验完成（错误见 [ERR] 与 Gate 汇总）=="
+
       # ===== 打包前 Gate：全链路唯一硬停点 =====
       # 读 /tmp/ci_errors.log：非空 → 打印全部错误并 exit 1（停，不冻库不打包）；空 → 进打包分发。
       - name: Gate (打包前最终判定：有暴露错误则停, 不打包)
@@ -388,11 +452,9 @@ jobs:
             mysql:8.4 \
             -o /tmp/bundle/images.tar
           zstd -o /tmp/bundle/images.tar.zst /tmp/bundle/images.tar && rm /tmp/bundle/images.tar
-          # etc（仓库 confs，保留 __SOAP_*__ 占位符供用户机替换）→ 直接铺到 env/dist/etc，解包即落位
-          mkdir -p /tmp/bundle/env/dist/etc
-          for f in $(find "${{ github.workspace }}/project/config/extra-config/confs" -type f -name '*.conf'); do
-            cp "$f" "/tmp/bundle/env/dist/etc/$(basename "$f")"
-          done
+          # 注：配置不打进包。核心 worldserver.conf/authserver.conf 与模组 conf 均不随包分发，
+          # 解包后由官方 entrypoint 从 .dist 生成完整默认（核心）、模组缺失键回退 C++ 默认。
+          # 部署时如需定制（如 SOAP），由用户机部署脚本追写，不污染默认基线。
           # 冻库
           cp "${{ github.workspace }}/ac-db-data.tar.zst" /tmp/bundle/
           # 地图（从官方 client-data 卷导出）→ 直接解到 env/dist/data，真机 bind-mount 即读，零归位
