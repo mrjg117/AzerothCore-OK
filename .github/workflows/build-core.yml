@@ -86,9 +86,23 @@ jobs:
           set -e
           BP="${{ github.workspace }}/acore-build-repo/build-patches"
           OFF="${{ github.workspace }}/official"
+          # 锁（lock）：build-patches 子目录名若不在 modules.txt 启用集合（且非 core）→ 跳过其补丁。
+          # 取代旧的 *.disabled 文件名后缀做法：是否启用完全由 modules.txt 列表驱动。
+          active=()
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            case "$url" in \#*) continue;; esac
+            m=$(basename "$url" .git); m=${m%-master}; active+=("$m")
+          done < "${{ github.workspace }}/acore-build-repo/config/modules.txt"
+          is_active() { local n="$1"; for a in "${active[@]}"; do [ "$a" = "$n" ] && return 0; done; return 1; }
           for moddir in "$BP"/*/; do
             [ -d "$moddir" ] || continue
             name=$(basename "$moddir")
+            # 锁：非 core 且不在启用列表 → 跳过（注释掉 / 列表里不存在 / 已停用）
+            if [ "$name" != "core" ] && ! is_active "$name"; then
+              echo "!! build-patches/$name 不在 modules.txt 启用列表，跳过其补丁 (lock)"
+              continue
+            fi
             # core 特例：补丁打到 official/ 根；其余打到 official/modules/<name>
             if [ "$name" = "core" ]; then tgt="$OFF"; else tgt="$OFF/modules/$name"; fi
             [ -d "$tgt" ] || { echo "!! target $tgt not found, skip $name"; continue; }

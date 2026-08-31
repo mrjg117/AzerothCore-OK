@@ -101,9 +101,23 @@ jobs:
           done < ../project/config/modules.txt
           # apply 核心/模组 build-patches（项目侧补丁，官方流程之上的输入）；全部试一遍，失败记全
           BP="${{ github.workspace }}/project/build-patches"
+          # 锁（lock）：build-patches 子目录名若不在 modules.txt 启用集合（且非 core）→ 视为被注释/停用/列表中不存在
+          # → 跳过其补丁，不报错。取代旧的 *.disabled 文件名后缀做法：是否启用完全由 modules.txt 列表驱动。
+          active=()
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            case "$url" in \#*) continue;; esac
+            m=$(basename "$url" .git); m=${m%-master}; active+=("$m")
+          done < "${{ github.workspace }}/project/config/modules.txt"
+          is_active() { local n="$1"; for a in "${active[@]}"; do [ "$a" = "$n" ] && return 0; done; return 1; }
           for moddir in "$BP"/*/; do
             [ -d "$moddir" ] || continue
             name=$(basename "$moddir")
+            # 锁：非 core 且不在启用列表 → 跳过（注释掉 / 列表里不存在 / 已停用）
+            if [ "$name" != "core" ] && ! is_active "$name"; then
+              echo "!! build-patches/$name 不在 modules.txt 启用列表，跳过其补丁 (lock)"
+              continue
+            fi
             if [ "$name" = "core" ]; then tgt="$PWD"; else tgt="$PWD/modules/$name"; fi
             [ -d "$tgt" ] || { rec "PATCH TARGET MISSING: $name -> $tgt (模组未 clone 成功)"; continue; }
             echo "== build-patches: $name -> $tgt =="

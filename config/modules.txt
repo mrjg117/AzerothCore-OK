@@ -42,9 +42,9 @@ https://github.com/Old-Man-Warcraft/mod-guild-levels.git
 https://github.com/Nevaden/mod-instant-swing.git
 # https://github.com/Nevaden/mod-item-affixes.git
 #   [2026-08-31] 暂时停用：汉化(druid/mage/hunter/rogue 按效果翻译 + C++ statNames 补丁)已落地到
-#   mod_zhcn/ 与 build-patches/mod-item-affixes/(itemaffix-statnames-zhcn.patch.disabled)，但本轮不启用，
-#   仅保留成果不浪费。重新启用时：去掉本行 # 注释，并把 build-patches/mod-item-affixes/*.disabled 改回
-#   *.sh / *.patch（去掉 .disabled 后缀）即可。
+#   mod_zhcn/ 与 build-patches/mod-item-affixes/，但本轮不启用，仅保留成果不浪费。
+#   重新启用时：去掉本行 # 注释即可 —— build-patches 锁会自动套用该目录下的补丁，无需改文件名
+#   （旧的 *.disabled 后缀做法已废除，改用 modules.txt 列表驱动跳过）。
 https://github.com/TrisBits/mod-junk-to-gold-plus.git
 https://github.com/KingDown-Assoc/mod-living-bomb.git
 https://github.com/azerothcore/mod-low-level-rbg.git
