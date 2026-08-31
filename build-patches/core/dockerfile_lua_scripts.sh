@@ -21,6 +21,7 @@ set -e
 #   1) build 阶段：COPY modules 之后，把所有 modules 下的 *.lua 收集到
 #      /azerothcore/lua_scripts（cd 进 modules 后用 cp --parents，保留模块
 #      子目录，避免不同模组同名 .lua 互相覆盖）。
+#      mkdir -p 兜底：即便 modules 下没有任何 .lua，目录也必建，避免步骤2 COPY 源 not found 整链失败。
 #   2) worldserver 运行时阶段：从 build 阶段 COPY /azerothcore/lua_scripts 进
 #      镜像 /azerothcore/lua_scripts。该路径正是 ALE 默认 ALE.ScriptPath
 #      解析到的位置（cwd=/azerothcore），故 ALE 启动时自动递归加载全部模组
@@ -51,7 +52,7 @@ s = open(p).read()
 anchor = "COPY modules /azerothcore/modules\n"
 inject = (
     "COPY modules /azerothcore/modules\n"
-    'RUN cd /azerothcore/modules && find . -type f -name "*.lua" '
+    'RUN mkdir -p /azerothcore/lua_scripts && cd /azerothcore/modules && find . -type f -name "*.lua" '
     '-exec cp --parents {} /azerothcore/lua_scripts/ \\;  # ACOK_LUA_COLLECT\n'
 )
 if anchor in s and "ACOK_LUA_COLLECT" not in s:
