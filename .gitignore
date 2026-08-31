@@ -33,3 +33,14 @@ deploy/patches/patches-manifest.txt          # 分卷清单（构建生成）
 deploy/docker-compose.yml                    # 官方基础编排，构建时从 GitHub 拉下打包，不进仓库
 __pycache__/
 *.pyc
+
+# 本地排查产物（CI 日志 / 审计草稿，不进仓库）
+.run*.log
+run*.log
+run*.err
+cache_dance_run.log
+*_full_audit.md
+*_review.md
+
+# WorkBuddy 会话目录中的临时下载（CI 日志/官方源码副本；记忆 .workbuddy/memory 仍入仓）
+.workbuddy/ci/

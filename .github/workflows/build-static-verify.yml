@@ -199,6 +199,7 @@ jobs:
       # 编译：core build-patch 已给 cmake --build 加 -- -k 0（Ninja 无限继续），暴露全部模组编译错；
       # 退出码非零记错误，并额外扫编译日志红标暴露。step 本体 exit 0，不挡后续（Gate 汇总停打包）。
       - name: Build core images (官方编译 + -k 0 暴露全部编译错; 全量暴露)
+        id: build
         run: |
           set +e
           : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
@@ -217,7 +218,16 @@ jobs:
           BUILDKIT_PROGRESS=plain docker compose --profile tools build 2>&1 | tee /tmp/build.log
           BRC=${PIPESTATUS[0]}
           echo "== build 退出码 = $BRC =="
-          if [ "$BRC" != "0" ]; then rec "BUILD: docker compose build 返回非零($BRC)"; fi
+          # build 失败 = 镜像没造出来。此时绝不能继续 up/校验：compose 会退回去拉 Docker Hub 上的
+          # 官方干净镜像（无模组），于是 db-import 只灌核心 updates、模组 SQL 一条不灌，L2 立刻刷出
+          # 上百条「文件未灌入」假阳性，把真正的构建错误埋掉（2026-08-31 三次连红就是这么被误导的）。
+          # 故：build 失败 → 记 1 条 BUILD 错误 + 跳过下游部署校验 → Gate 直接停，日志干净指根因。
+          if [ "$BRC" != "0" ]; then
+            rec "BUILD: docker compose build 返回非零($BRC) —— 镜像未产出，跳过部署与 SQL 校验以免假阳性掩盖根因"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
           echo "== 编译错误关键字扫描（error:/FAILED/undefined reference/Error） =="
           grep -Ea 'error:|FAILED|undefined reference|Error ' /tmp/build.log | head -60 || true
           echo "== build done (完整日志见 build-log 工件；错误见 [ERR] 与 Gate 汇总) =="
@@ -232,6 +242,7 @@ jobs:
 
       # 拉起整套服务：官方部署。compose up 返回非零（某服务未正常起）吸掉，交 Verify 抓日志。不硬停。
       - name: Bring up stack (官方部署：官方 ac-client-data-init 拉地图灌卷; 全量暴露)
+        if: steps.build.outputs.ok != 'false'
         run: |
           set +e
           : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
@@ -257,6 +268,7 @@ jobs:
       # Verify：收集全部部署错误进 /tmp/ci_errors.log 并打印，step 本体 exit 0（不红、不挡）。
       # 轮询只等「完成信号」(ready/exited)，错误检测在末尾全量扫（累积流，非 tail 截断）。致命判据只在 Gate 汇总停打包。
       - name: Verify deployment (收集全部部署错误; 全量暴露)
+        if: steps.build.outputs.ok != 'false'
         run: |
           set +e
           : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
@@ -373,6 +385,7 @@ jobs:
       #           补 L1 盲区——纯 INSERT/UPDATE 的 data-only 文件漏灌。
       # 命中即 rec() 记 [ERR]，由 Gate 统一拦下不打包。
       - name: Verify module SQL completeness (L1 声明级 + L2 文件级对账)
+        if: steps.build.outputs.ok != 'false'
         run: |
           set +e
           : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
@@ -404,12 +417,12 @@ jobs:
           if [ -s /tmp/miss_cols.txt ]; then echo "!! 声明了但库里没有的列:"; cat /tmp/miss_cols.txt; while read -r c; do [ -n "$c" ] && rec "SQL-L1: 列缺失 $c"; done < /tmp/miss_cols.txt; fi
 
           # ---- L2 文件级 ----
-          # mod-playerbots 不完全排除，只排除两个不该进账本的目录：
-          #   base/   —— 由模组自身安装器应用，不进 updates 账本（排除它，否则满屏假缺失）
-          #   create/ —— 不在 updates_include 白名单内（含 drop_mysql.sql，本就不该灌）
-          # 保留 updates/ custom/ archive/ —— 这三个是其 updates_include 白名单目录，必须全都进账本。
+          # 通用排除（不写死任何模组名——写死模组名就是技术债，上游一改目录就漏判）：
+          #   base/    —— 官方 auto-populate 灌，不进 updates 账本（算进期望=必然假缺失）
+          #   create/  —— 不在 updates_include 白名单内（含 drop_mysql.sql，本就不该灌）
+          # 保留 updates/ custom/ archive/ —— 这些走 DBUpdater，必须全都进账本。
           find modules -name "*.sql" -type f | grep -iE "/data/sql/[^/]*(auth|characters|world|playerbots)[^/]*/" \
-            | grep -vE "/mod-playerbots/data/sql/playerbots/(base|create)/" \
+            | grep -viE "/(base|create)/" \
             | grep -viE "/(create|drop)_mysql(_8)?\.sql$|/updates\.sql$|/updates_include\.sql$|/version_db_[a-z]+\.sql$" \
             | sed 's#.*/##' | sort -u > /tmp/exp_files.txt
           : > /tmp/app_files.txt

@@ -68,6 +68,12 @@ PY
 fi
 
 # --- 2) worldserver 运行时阶段：把 lua_scripts 拷进镜像 ---
+# ⚠ 标记注释必须独占一行（`ACOK_LUA_COPY` 前置于 COPY 指令之上），绝不能写成
+#   COPY 续行末尾的 `... /azerothcore/lua_scripts  # ACOK_LUA_COPY`。
+#   Dockerfile 只有「行首 #」才算注释，行尾的 # 会被当普通参数：BuildKit 于是把
+#   `#` 当成一个源路径去算校验和，报 `failed to calculate checksum of ref ...: "/#": not found`，
+#   整个 ac-worldserver target 构建失败（2026-08-31 CI 三次连红的真正根因）。
+#   RUN 指令不受影响（行尾 # 交给 shell 当注释），但 COPY/ADD/ENV 等非 shell 指令会中招。
 if grep -q 'ACOK_LUA_COPY' "$DF"; then
   echo "lua copy already patched, skip"
 else
@@ -79,8 +85,9 @@ s = open(p).read()
 anchor = "ENV ACORE_COMPONENT=worldserver\n"
 inject = (
     "ENV ACORE_COMPONENT=worldserver\n"
+    "# ACOK_LUA_COPY\n"
     "COPY --chown=$DOCKER_USER:$DOCKER_USER --from=build \\\n"
-    "     /azerothcore/lua_scripts /azerothcore/lua_scripts  # ACOK_LUA_COPY\n"
+    "     /azerothcore/lua_scripts /azerothcore/lua_scripts\n"
 )
 if anchor in s and "ACOK_LUA_COPY" not in s:
     s = s.replace(anchor, inject, 1)
