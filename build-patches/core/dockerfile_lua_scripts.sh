@@ -18,9 +18,10 @@ set -e
 #
 # 修复（与 dockerfile_playerbots_sql.sh 同范式，补丁打到官方 clone 副本，
 # 不动官方本体；本地构建不套本补丁时仍是官方原行为）：
-#   1) build 阶段：COPY modules 之后，把所有 modules 下的 *.lua 收集到
-#      /azerothcore/lua_scripts（cd 进 modules 后用 cp --parents，保留模块
-#      子目录，避免不同模组同名 .lua 互相覆盖）。
+#   1) build 阶段：COPY modules 之后，收集「服务端」Lua 进 /azerothcore/lua_scripts。
+#      通用判定(不靠目录名): 某 .lua 的目录树含 .toc → 客户端插件(服务端无 CreateFrame)
+#      → 跳过; 否则收集(cp --parents 保留模块子目录, 避免同名 .lua 互相覆盖)。
+#      客户端插件另由 extract_client_addons.sh 提取进 client-patches/ (见 .github/scripts)。
 #      mkdir -p 兜底：即便 modules 下没有任何 .lua，目录也必建，避免步骤2 COPY 源 not found 整链失败。
 #   2) worldserver 运行时阶段：从 build 阶段 COPY /azerothcore/lua_scripts 进
 #      镜像 /azerothcore/lua_scripts。该路径正是 ALE 默认 ALE.ScriptPath
@@ -52,8 +53,17 @@ s = open(p).read()
 anchor = "COPY modules /azerothcore/modules\n"
 inject = (
     "COPY modules /azerothcore/modules\n"
-    'RUN mkdir -p /azerothcore/lua_scripts && cd /azerothcore/modules && find . -type f -name "*.lua" '
-    '-exec cp --parents {} /azerothcore/lua_scripts/ \\;  # ACOK_LUA_COLLECT\n'
+    "# ACOK_LUA_COLLECT: 收集「服务端」Lua。通用规则(不靠目录名):\n"
+    "#   某 .lua 所在目录树(向上)含 .toc → 客户端插件(服务端无 CreateFrame) → 跳过;\n"
+    "#   否则服务端脚本 → 收集进 /azerothcore/lua_scripts(cp --parents 保留模块子目录)。\n"
+    "RUN mkdir -p /azerothcore/lua_scripts && cd /azerothcore/modules \\\n"
+    " && ADDON_DIRS=$(find . -name '*.toc' -printf '%h\\n' | sort -u) \\\n"
+    " && find . -type f -name '*.lua' | while IFS= read -r f; do \\\n"
+    "      skip=0; \\\n"
+    "      for d in $ADDON_DIRS; do [ -z \"$d\" ] && continue; case \"$f\" in \"$d/\"*) skip=1; break;; esac; done; \\\n"
+    "      [ \"$skip\" = 1 ] && continue; \\\n"
+    "      cp --parents \"$f\" /azerothcore/lua_scripts/; \\\n"
+    "    done  # ACOK_LUA_COLLECT\n"
 )
 if anchor in s and "ACOK_LUA_COLLECT" not in s:
     s = s.replace(anchor, inject, 1)

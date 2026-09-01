@@ -27,6 +27,8 @@ client-patches/patches-client.zip
 
 # 构建产物（不进仓库）
 client-patches/*/addon/                      # 构建期按 addons.txt 从上游克隆的 AddOn
+client-patches/*/Interface/addons/           # 构建期按 .toc 规则从 modules 提取的客户端插件
+client-patches/*/data/zhcn/                 # 构建期按 .toc 规则从 modules 提取的 zhCN 数据/MPQ
 deploy/patches/patches-client.zip
 deploy/patches/patches-client.zip.*          # split 分卷产物
 deploy/patches/patches-manifest.txt          # 分卷清单（构建生成）
@@ -42,5 +44,5 @@ cache_dance_run.log
 *_full_audit.md
 *_review.md
 
-# WorkBuddy 会话目录中的临时下载（CI 日志/官方源码副本；记忆 .workbuddy/memory 仍入仓）
-.workbuddy/ci/
+# WorkBuddy 会话缓存（记忆/automations/ci 等）属 AI 工具产物，非项目文件，一律不入库
+.workbuddy/

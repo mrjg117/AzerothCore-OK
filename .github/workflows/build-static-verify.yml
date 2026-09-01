@@ -160,6 +160,18 @@ jobs:
           done
           echo "== modules mounted + patches applied (错误见上方 [ERR] 与 Gate 汇总) =="
 
+      # 提取客户端插件 / zhCN 数据：从已克隆模组(modules/)中按通用规则(.toc=客户端插件)提取
+      # 进 client-patches/<模组名>/Interface/addons/ 与 data/zhcn/，供 make-archive 打包给玩家客户端。
+      - name: Extract client addons & zhCN data (通用 .toc 规则)
+        run: |
+          set +e
+          : "${CI_ERR:=/tmp/ci_errors.log}"; touch "$CI_ERR"
+          bash "${{ github.workspace }}/project/.github/scripts/extract_client_addons.sh" \
+            "${{ github.workspace }}/official/modules" \
+            "${{ github.workspace }}/project/client-patches" \
+            "${{ github.workspace }}/project/config/modules.txt"
+          echo "== client addons/data extracted (错误见 [ERR] 与 Gate 汇总) =="
+
       # 通用 SQL 归置引擎（docs R11）：把"放错位置"的模组 SQL 归置到官方 db-import 能扫到的位置。
       # 必须在本步之后执行：apply_core_and_gen_sql.sh 会生成仓库里没有的 SQL（item-affixes）。
       # 全规则驱动、零模组名硬编码、零目录名黑名单；db-import 仍只跑一次。
