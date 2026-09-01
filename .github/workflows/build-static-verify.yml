@@ -296,29 +296,47 @@ jobs:
           echo "ac-db-import exit code = $DI_RC"
           if [ "$DI_RC" != "0" ] && [ "$DI_RC" != "NA" ]; then echo "!! ac-db-import 异常退出($DI_RC)"; rec "VERIFY: ac-db-import 异常退出($DI_RC)"; FAIL=1; fi
 
-          # ===== 2) worldserver：轮询只等"完成信号"(ready / exited)，不当错误探测器 =====
-          WS_READY=0; WS_EXITED=0; WS_CODE=0
+          # ===== 2) worldserver：真正判定就绪/崩溃，不靠"非 ready 且非 exited"的漏判 =====
+          # 历史 bug：旧判定 `未 ready 且 未 exited → FAIL` 把"崩溃且被 restart 拉起"当成了"非失败"，
+          # 导致 worldserver 实际崩了却报绿（2026-08-31 run 33445776890 实测 ready=0 仍全绿）。
+          # 修正：只要最终未就绪，且发生过"退出/重启"任一 → 判定崩溃失败；全程捕获完整日志供查真因。
+          WS_READY=0; WS_EXITED=0; WS_CODE=0; WS_RESTARTS=0
           for i in $(seq 1 90); do
             CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
             if [ -n "$CID" ]; then
               ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
               EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
-              if [ "$ST" = "exited" ]; then WS_EXITED=1; WS_CODE=$EC; break; fi
+              RC=$(docker inspect -f '{{.State.RestartCount}}' "$CID" 2>/dev/null)
+              [ "${RC:-0}" != "0" ] && WS_RESTARTS=$RC
+              if [ "$ST" = "exited" ]; then WS_EXITED=1; WS_CODE=$EC; fi
             fi
-            docker compose logs ac-worldserver 2>/dev/null > /tmp/ws.log || true
+            docker compose logs --no-color ac-worldserver 2>/dev/null > /tmp/ws.log || true
             if grep -Eqi 'azerothcore>|WorldSession|World initialized|server is (now )?accepting|Worldserver is ready' /tmp/ws.log; then WS_READY=1; break; fi
+            # 已退出且重启次数为 0（restart:unless-stopped 也没救回来）→ 没意义继续等，去抓日志
+            if [ "$WS_EXITED" = "1" ] && [ "${WS_RESTARTS:-0}" = "0" ]; then break; fi
             sleep 10
           done
-          docker compose logs ac-worldserver 2>/dev/null > /tmp/ws.log || true
-          echo "==== worldserver log (FULL scan, last 400 for review) ===="; cat -v /tmp/ws.log | sed 's/\^\[\[[0-9;]*m//g' | tail -n 400
-          # 最终进程状态复核（覆盖"ready 后又崩"低概率）
-          CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
-          if [ -n "$CID" ]; then
-            ST=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
-            EC=$(docker inspect -f '{{.State.ExitCode}}' "$CID" 2>/dev/null)
-            if [ "$ST" = "exited" ] && [ "${EC:-0}" != "0" ]; then echo "!! worldserver 崩溃退出(code=$EC)"; rec "VERIFY: worldserver 崩溃退出(code=$EC)"; FAIL=1; fi
+          docker compose logs --no-color ac-worldserver 2>/dev/null > /tmp/ws.log || true
+          cp /tmp/ws.log /tmp/ws_full.log 2>/dev/null || true
+          echo "==== worldserver 状态: ready=$WS_READY exited=$WS_EXITED code=$WS_CODE restarts=$WS_RESTARTS ===="
+          # 崩溃/就绪失败最相关的信号行（不全量打印，避免刷屏；完整版在工件 worldserver-log）
+          echo "==== worldserver 关键错误信号（崩溃/异常/失败关键字）===="
+          grep -Eai 'error|crash|fatal|exception|assert|cannot|fail|unknown|stack trace|segfault|signal|abort|terminate' /tmp/ws.log \
+            | cat -v | sed 's/\^\[\[[0-9;]*m//g' | tail -n 60 || echo "（无错误信号关键字命中）"
+          echo "==== worldserver 头部 60 行（启动阶段）===="
+          cat -v /tmp/ws.log | sed 's/\^\[\[[0-9;]*m//g' | head -n 60
+          echo "==== worldserver 尾部 150 行（崩溃通常在此）===="
+          cat -v /tmp/ws.log | sed 's/\^\[\[[0-9;]*m//g' | tail -n 150
+          if [ "$WS_READY" != "1" ]; then
+            if [ "$WS_EXITED" = "1" ] || [ "${WS_RESTARTS:-0}" != "0" ]; then
+              echo "!! worldserver 未就绪且发生崩溃/重启(exited=$WS_EXITED code=$WS_CODE restarts=$WS_RESTARTS)"
+              rec "VERIFY: worldserver 未就绪且发生崩溃/重启(exited=$WS_EXITED code=$WS_CODE restarts=$WS_RESTARTS)"
+            else
+              echo "!! worldserver 超时未就绪(仍在运行但一直没出就绪信号)"
+              rec "VERIFY: worldserver 超时未就绪(仍在运行但一直没出就绪信号)"
+            fi
+            FAIL=1
           fi
-          if [ "$WS_READY" != "1" ] && [ "$WS_EXITED" != "1" ]; then echo "!! worldserver 超时未 ready 也未崩溃（起不来）"; rec "VERIFY: worldserver 超时未 ready 也未崩溃"; FAIL=1; fi
 
           # ===== 2b) 地图落地硬校验：官方 ac-client-data-init 灌的卷内 maps/dbc/vmaps/mmaps/Cameras 必须非空 =====
           WS_CID=$(docker compose ps -q ac-worldserver 2>/dev/null)
@@ -377,6 +395,14 @@ jobs:
           grep -Ea "$RED_RE" /tmp/as.log | cat -v | sed 's/\^\[\[[0-9;]*m//g' | head -20 || true
 
           if [ "$FAIL" != "0" ]; then echo "!! 部署暴露错误（已记入 /tmp/ci_errors.log，交 Gate 步停打包）"; else echo "部署本地检查无致命错误（Gate 汇总全部环节后最终判定）"; fi
+
+      - name: Upload worldserver log (完整日志; 失败也传)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: worldserver-log
+          path: /tmp/ws_full.log
+          if-no-files-found: warn
 
       # ===== 模组 SQL 完整性校验（docs R11 / 4.4.1）=====
       # L1 声明级：遍历所有模组 .sql 抽 CREATE TABLE / ALTER TABLE ADD COLUMN，与 information_schema 对账。
