@@ -67,7 +67,7 @@ generic_block = '''            // === ZERO-CONFIG MODULE ENABLE (OK build-patch)
             // warning is logged. Core critical options (no '.') keep Fatal.
             if (name.find('.') != std::string::npos)
             {
-                LOG_WARNING("server.loading",
+                LOG_WARN("server.loading",
                     "> Config: [zero-config] module option '{}' missing, auto-default (module enabled).",
                     name);
                 return def;
@@ -96,7 +96,7 @@ string_block = '''            // === ZERO-CONFIG MODULE ENABLE (OK build-patch) 
                 std::string safeDefault = def;
                 if (iends_with(name, ".Enable") || iends_with(name, ".Enabled"))
                     safeDefault = "1";
-                LOG_WARNING("server.loading",
+                LOG_WARN("server.loading",
                     "> Config: [zero-config] module option '{}' missing, auto-default '{}' (module enabled).",
                     name, safeDefault);
                 return safeDefault;
