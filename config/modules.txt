@@ -39,7 +39,10 @@ https://github.com/mahssel-dev/mod-classic-warrior-additions.git
 https://github.com/silviu20092/mod-dynamic-gathering-speed.git
 https://github.com/CDBrodie/mod-enhanced-worldchat.git
 https://github.com/Old-Man-Warcraft/mod-guild-levels.git
-https://github.com/Nevaden/mod-instant-swing.git
+# https://github.com/Nevaden/mod-instant-swing.git
+#   [2026-09-03] 停用：把「下一次近战攻击触发」类技能改为按键立即释放 ——
+#   英勇打击 / 顺劈斩（战士）、挥击（德鲁伊）、符文打击（死亡骑士）、猛禽一击（猎人）。
+#   当前不启用，保留 WotLK 原版手感。重新启用时：去掉下面本行的 # 注释即可。
 # https://github.com/Nevaden/mod-item-affixes.git
 #   [2026-08-31] 暂时停用：汉化(druid/mage/hunter/rogue 按效果翻译 + C++ statNames 补丁)已落地到
 #   mod_zhcn/ 与 build-patches/mod-item-affixes/，但本轮不启用，仅保留成果不浪费。
